@@ -1,0 +1,15 @@
+{
+  "name": "roam-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "secret": "wrangler secret put ROAM_API_TOKEN"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241106.0",
+    "typescript": "^5.5.2",
+    "wrangler": "^4.0.0"
+  }
+}

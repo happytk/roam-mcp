@@ -1,0 +1,9 @@
+name = "roam-mcp"
+main = "src/index.ts"
+compatibility_date = "2024-11-05"
+
+[vars]
+ROAM_GRAPH_NAME = "happytk"
+
+# ROAM_API_TOKEN은 평문 저장 금지 — 배포 후 아래 명령으로 설정:
+# npx wrangler secret put ROAM_API_TOKEN
