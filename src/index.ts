@@ -261,7 +261,7 @@ async function callTool(
       await roamWrite(env, {
         action: "create-block",
         location: { "page-title": pageTitle, order: "last" },
-        block: { string: `{{[[TODO]]}} ${task}`, uid: uid() },
+        block: { string: `{{[[TODO]]}} ${task} #ai`, uid: uid() },
       });
       return JSON.stringify({ success: true, page: pageTitle });
     }
@@ -271,7 +271,7 @@ async function callTool(
       await roamWrite(env, {
         action: "create-block",
         location: { "page-title": page, order: "last" },
-        block: { string: content, uid: uid() },
+        block: { string: `#ai ${content}`, uid: uid() },
       });
       return JSON.stringify({ success: true, page });
     }
