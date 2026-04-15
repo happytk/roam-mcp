@@ -393,11 +393,56 @@ export default {
           headers: { Allow: "POST" },
         }));
       }
+
+      // Setup diagnostics: GET /check actually hits the Roam API to verify
+      // that the token + graph name are configured correctly.
+      if (url.pathname === "/check") {
+        const hasToken = !!env.ROAM_API_TOKEN;
+        const tokenPrefix = env.ROAM_API_TOKEN?.slice(0, 17) ?? "";
+        const tokenLooksValid = tokenPrefix.startsWith("roam-graph-token-");
+        if (!hasToken) {
+          return withCors(Response.json({
+            ok: false,
+            stage: "token",
+            error: "ROAM_API_TOKEN secret is not set. Run: npx wrangler secret put ROAM_API_TOKEN",
+          }, { status: 500 }));
+        }
+        if (!tokenLooksValid) {
+          return withCors(Response.json({
+            ok: false,
+            stage: "token",
+            error: `Token does not start with "roam-graph-token-" (got prefix: "${tokenPrefix}"). Local tokens ("roam-graph-local-token-") cannot be used with the API.`,
+          }, { status: 500 }));
+        }
+        try {
+          // Minimal query: just fetch one page title to confirm auth works.
+          const result = await roamQuery(
+            env,
+            "[:find ?title :where [?p :node/title ?title] :limit 1]"
+          );
+          return withCors(Response.json({
+            ok: true,
+            graph: env.ROAM_GRAPH_NAME,
+            message: "Token and graph name are valid. Roam API responded successfully.",
+            sampleCount: result.result?.length ?? 0,
+          }));
+        } catch (err) {
+          return withCors(Response.json({
+            ok: false,
+            stage: "roam-api",
+            graph: env.ROAM_GRAPH_NAME,
+            error: String(err),
+            hint: "Check that ROAM_GRAPH_NAME in wrangler.toml matches your graph exactly, and that the token belongs to that graph.",
+          }, { status: 500 }));
+        }
+      }
+
       return withCors(
         Response.json({
           status: "ok",
           server: "roam-research-mcp",
           graph: env.ROAM_GRAPH_NAME,
+          tokenConfigured: !!env.ROAM_API_TOKEN,
         })
       );
     }

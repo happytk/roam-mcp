@@ -1,0 +1,9 @@
+# Copy this file to `.dev.vars` for local `npm run dev` only.
+# This file is safe to commit; `.dev.vars` is gitignored.
+#
+# These values are NOT used when deployed. Production uses:
+#   - ROAM_GRAPH_NAME from wrangler.toml [vars]
+#   - ROAM_API_TOKEN from `wrangler secret put`
+
+ROAM_API_TOKEN=roam-graph-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ROAM_GRAPH_NAME=your-graph-name

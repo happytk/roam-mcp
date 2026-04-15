@@ -23,6 +23,8 @@ Roam Research MCP 서버 — Cloudflare Workers에 배포하여 Claude.ai 모바
 
 ## 설치 및 배포
 
+> 순서가 중요합니다. Secret은 Worker가 배포된 후에 등록해야 안정적으로 동작합니다.
+
 ### 1. 의존성 설치
 
 ```bash
@@ -37,21 +39,7 @@ npx wrangler login
 
 브라우저가 열리면 Cloudflare 계정으로 로그인합니다.
 
-### 3. API 토큰을 Secret으로 등록
-
-```bash
-npx wrangler secret put ROAM_API_TOKEN
-```
-
-프롬프트에 Roam API 토큰을 입력합니다. (`.dev.vars`나 `wrangler.toml`에 평문으로 저장하지 않음)
-
-등록 확인:
-
-```bash
-npx wrangler secret list
-```
-
-### 4. 그래프 이름 설정
+### 3. 그래프 이름 설정
 
 `wrangler.toml`의 `ROAM_GRAPH_NAME` 값을 본인 그래프 이름으로 수정합니다.
 
@@ -60,23 +48,71 @@ npx wrangler secret list
 ROAM_GRAPH_NAME = "your-graph-name"
 ```
 
-### 5. 배포
+> 그래프 이름은 Roam URL `roamresearch.com/#/app/<graph-name>` 의 `<graph-name>` 과 정확히 일치해야 합니다. 대소문자와 하이픈까지 동일해야 합니다.
+
+### 4. 최초 배포 (Worker 생성)
 
 ```bash
 npx wrangler deploy
 ```
 
-배포 완료 시 URL이 출력됩니다:
+이 시점에서는 `ROAM_API_TOKEN` 이 없어서 API 호출은 실패하지만, Worker 자체는 생성됩니다. 배포 완료 시 URL이 출력됩니다:
 
 ```
 https://roam-mcp.{your-account}.workers.dev
 ```
 
-### 6. 동작 확인
+### 5. API 토큰을 Secret으로 등록
+
+```bash
+npx wrangler secret put ROAM_API_TOKEN
+```
+
+프롬프트에 Roam API 토큰을 **앞뒤 공백 없이** 붙여넣습니다. (`.dev.vars`나 `wrangler.toml`에 평문으로 저장하지 않음)
+
+> 주의: 토큰은 `roam-graph-token-` 으로 시작해야 합니다. `roam-graph-local-token-` 으로 시작하는 로컬 전용 토큰은 API로 사용할 수 없습니다.
+
+등록 확인:
+
+```bash
+npx wrangler secret list
+```
+
+Secret은 즉시 반영되므로 재배포가 필요하지 않습니다.
+
+### 6. 토큰 검증 (중요)
+
+셋업이 올바른지 한 번에 확인할 수 있는 진단 엔드포인트입니다:
+
+```bash
+curl https://roam-mcp.{your-account}.workers.dev/check
+```
+
+성공 응답:
+
+```json
+{
+  "ok": true,
+  "graph": "your-graph-name",
+  "message": "Token and graph name are valid. Roam API responded successfully.",
+  "sampleCount": 1
+}
+```
+
+실패 응답 예시와 대응:
+
+| `stage` | 원인 | 해결 |
+|---|---|---|
+| `token` + "not set" | Secret이 미등록 | 5단계 재실행 |
+| `token` + "does not start with" | 토큰 접두사 오류 | `roam-graph-token-`으로 시작하는 토큰으로 재등록 |
+| `roam-api` + "Token cannot be verified" | 토큰이 해당 그래프 소유가 아님 | 그래프 이름/토큰 매칭 재확인 |
+| `roam-api` + "404" | 그래프 이름 오타 | `wrangler.toml` 수정 후 `npx wrangler deploy` |
+
+### 7. MCP 엔드포인트 동작 확인
 
 ```bash
 curl https://roam-mcp.{your-account}.workers.dev/
-# {"status":"ok","server":"roam-research-mcp","graph":"your-graph-name"}
+# {"status":"ok","server":"roam-research-mcp","graph":"your-graph-name","tokenConfigured":true}
 
 curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
   -H "Content-Type: application/json" \
@@ -114,18 +150,23 @@ Claude Desktop은 [roam-research-mcp](https://github.com/2b3pro/roam-research-mc
 
 ## 로컬 개발
 
-`.dev.vars` 파일 생성 (`.gitignore`에 포함됨):
+`.dev.vars.example` 파일을 복사해 `.dev.vars` 를 만듭니다 (`.gitignore`에 포함됨):
 
+```bash
+cp .dev.vars.example .dev.vars
+# 이후 .dev.vars 파일을 열어 본인 토큰과 그래프 이름으로 수정
 ```
-ROAM_API_TOKEN=roam-graph-token-...
-ROAM_GRAPH_NAME=your-graph-name
-```
+
+> `.dev.vars` 는 **로컬 `npm run dev` 전용**입니다. 배포 환경에는 영향을 주지 않으며, 배포 환경은 `wrangler secret put` 으로 등록한 값을 사용합니다.
 
 로컬 서버 실행:
 
 ```bash
 npm run dev
 # http://localhost:8787 에서 실행
+
+# 로컬에서도 /check 로 검증 가능
+curl http://localhost:8787/check
 ```
 
 ## 제공 도구
@@ -145,8 +186,11 @@ npm run dev
 ## 트러블슈팅
 
 **토큰 오류 (`Token cannot be verified`)**
+- 먼저 `/check` 엔드포인트로 원인을 진단: `curl https://roam-mcp.xxx.workers.dev/check`
 - Roam API 토큰이 `roam-graph-token-`으로 시작하는지 확인
 - `roam-graph-local-token-`으로 시작하는 것은 로컬 전용 토큰으로 API 사용 불가
+- 토큰이 등록한 그래프 이름과 일치하는지 확인 (각 그래프마다 별도 토큰 발급)
+- Secret 재등록: `npx wrangler secret put ROAM_API_TOKEN`
 
 **Secret이 사라진 경우**
 - `npx wrangler secret put ROAM_API_TOKEN`으로 재등록
