@@ -61,12 +61,58 @@ function todayPageTitle(): string {
     "July", "August", "September", "October", "November", "December",
   ];
   const day = d.getDate();
-  const suffix =
-    day === 1 || day === 21 || day === 31 ? "st" :
-    day === 2 || day === 22 ? "nd" :
-    day === 3 || day === 23 ? "rd" : "th";
+  const suffix = ordinalSuffix(day);
   return `${months[d.getMonth()]} ${day}${suffix}, ${d.getFullYear()}`;
 }
+
+function ordinalSuffix(day: number): string {
+  return day === 1 || day === 21 || day === 31 ? "st" :
+         day === 2 || day === 22 ? "nd" :
+         day === 3 || day === 23 ? "rd" : "th";
+}
+
+// Roam daily note titles MUST use ordinal suffixes, e.g. "April 16th, 2026".
+// LLMs frequently produce "April 16, 2026" which Roam treats as a completely
+// separate page. Detect that shape and normalize it so the correct daily note
+// is used regardless of how the caller spelled it.
+const DAILY_NOTE_NO_SUFFIX =
+  /^(January|February|March|April|May|June|July|August|September|October|November|December) (\d{1,2}), (\d{4})$/;
+
+function normalizePageTitle(title: string): string {
+  const match = title.match(DAILY_NOTE_NO_SUFFIX);
+  if (!match) return title;
+  const [, month, dayStr, year] = match;
+  const day = parseInt(dayStr, 10);
+  if (day < 1 || day > 31) return title;
+  return `${month} ${day}${ordinalSuffix(day)}, ${year}`;
+}
+
+// --- Server-level instructions (sent in MCP initialize response) ---
+
+const ROAM_INSTRUCTIONS = `This server writes to a Roam Research graph.
+
+Roam conventions you MUST follow:
+
+1. Daily note titles use ordinal suffixes: "April 16th, 2026", NOT "April 16, 2026".
+   Roam treats "April 16, 2026" as a completely separate page, so using the wrong
+   format silently creates the wrong page.
+
+2. When the user says "today", "오늘", or refers to today's daily note, DO NOT pass
+   today's date as the \`page\` argument. Instead, OMIT the \`page\` argument entirely
+   — roam_add_todo and roam_create_block both default to today's daily note when
+   \`page\` is omitted, and the server computes the correct title.
+
+3. Do NOT call roam_create_page for today's daily note. Daily notes are auto-created
+   when roam_add_todo or roam_create_block writes to them. Use roam_create_page only
+   for genuinely new non-date pages.
+
+4. When referencing a specific past/future daily note, always use the ordinal format
+   (e.g. "March 3rd, 2026", "January 1st, 2026"). The server normalizes common
+   mistakes like "March 3, 2026" as a safety net, but explicit correct formatting
+   is preferred.
+
+All blocks and new pages created via this server are automatically tagged with #ai
+so the user can distinguish AI-generated content from their own notes.`;
 
 // --- Tool definitions ---
 
@@ -82,7 +128,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Exact page title" },
+        title: {
+          type: "string",
+          description:
+            "Exact page title. For daily notes use ordinal format like 'April 16th, 2026' (NOT 'April 16, 2026').",
+        },
       },
       required: ["title"],
     },
@@ -129,25 +179,32 @@ const TOOLS = [
   },
   {
     name: "roam_create_page",
-    description: "Create a new page in Roam Research",
+    description:
+      "Create a new page in Roam Research. Do NOT use this to create today's daily note — daily notes are auto-created when roam_add_todo or roam_create_block writes to them.",
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "New page title" },
+        title: {
+          type: "string",
+          description:
+            "New page title. For daily notes use ordinal format like 'April 16th, 2026' (NOT 'April 16, 2026').",
+        },
       },
       required: ["title"],
     },
   },
   {
     name: "roam_add_todo",
-    description: "Add a TODO block to a page (defaults to today's daily note)",
+    description:
+      "Add a TODO block to a page. Defaults to today's daily note when `page` is omitted — this is the correct way to add to today. Do NOT pass today's date as `page`; omit it instead.",
     inputSchema: {
       type: "object",
       properties: {
         task: { type: "string", description: "Task description" },
         page: {
           type: "string",
-          description: "Target page title. Omit to use today's daily note.",
+          description:
+            "Target page title. Omit to use today's daily note (preferred for 'today'). If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'.",
         },
       },
       required: ["task"],
@@ -155,14 +212,19 @@ const TOOLS = [
   },
   {
     name: "roam_create_block",
-    description: "Append a text block to a page",
+    description:
+      "Append a text block to a page. Defaults to today's daily note when `page` is omitted. Do NOT pass today's date as `page`; omit it instead.",
     inputSchema: {
       type: "object",
       properties: {
-        page: { type: "string", description: "Target page title" },
+        page: {
+          type: "string",
+          description:
+            "Target page title. Omit to use today's daily note (preferred for 'today'). If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'.",
+        },
         content: { type: "string", description: "Block content (supports Roam markdown)" },
       },
-      required: ["page", "content"],
+      required: ["content"],
     },
   },
   {
@@ -198,7 +260,7 @@ async function callTool(
     }
 
     case "roam_fetch_page_by_title": {
-      const { title } = args;
+      const title = normalizePageTitle(args.title);
       const query =
         `[:find (pull ?p [:node/title :block/uid ` +
         `{:block/children [:block/string :block/uid :block/order ` +
@@ -247,7 +309,7 @@ async function callTool(
     }
 
     case "roam_create_page": {
-      const { title } = args;
+      const title = normalizePageTitle(args.title);
       await roamWrite(env, {
         action: "create-page",
         page: { title, uid: uid() },
@@ -261,8 +323,8 @@ async function callTool(
     }
 
     case "roam_add_todo": {
-      const { task, page } = args;
-      const pageTitle = page ?? todayPageTitle();
+      const { task } = args;
+      const pageTitle = args.page ? normalizePageTitle(args.page) : todayPageTitle();
       await roamWrite(env, {
         action: "create-block",
         location: { "page-title": pageTitle, order: "last" },
@@ -272,13 +334,14 @@ async function callTool(
     }
 
     case "roam_create_block": {
-      const { page, content } = args;
+      const { content } = args;
+      const pageTitle = args.page ? normalizePageTitle(args.page) : todayPageTitle();
       await roamWrite(env, {
         action: "create-block",
-        location: { "page-title": page, order: "last" },
+        location: { "page-title": pageTitle, order: "last" },
         block: { string: `${content} #ai`, uid: uid() },
       });
-      return JSON.stringify({ success: true, page });
+      return JSON.stringify({ success: true, page: pageTitle });
     }
 
     case "roam_datomic_query": {
@@ -330,6 +393,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
           protocolVersion,
           serverInfo: { name: "roam-research", version: "1.0.0" },
           capabilities: { tools: { listChanged: false } },
+          instructions: ROAM_INSTRUCTIONS,
         },
       });
     }

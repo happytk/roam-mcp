@@ -205,10 +205,23 @@ curl http://localhost:8787/check
 | `roam_search_by_text` | 텍스트 전체 검색 |
 | `roam_search_for_tag` | 특정 태그/페이지를 참조하는 블록 검색 |
 | `roam_search_by_status` | TODO / DONE / LATER 상태별 블록 검색 |
-| `roam_create_page` | 새 페이지 생성 |
-| `roam_add_todo` | TODO 항목 추가 (기본값: 오늘 데일리 노트) |
-| `roam_create_block` | 지정 페이지에 블록 추가 |
+| `roam_create_page` | 새 페이지 생성 (데일리 노트에는 사용 금지) |
+| `roam_add_todo` | TODO 항목 추가 (`page` 생략 시 오늘 데일리 노트) |
+| `roam_create_block` | 블록 추가 (`page` 생략 시 오늘 데일리 노트) |
 | `roam_datomic_query` | 직접 Datalog 쿼리 실행 |
+
+## LLM이 지켜야 할 Roam 컨벤션
+
+서버가 MCP `initialize` 응답의 `instructions` 필드로 아래 규칙을 LLM에 전달합니다. 개별 도구 description에도 동일 규칙이 박혀 있어서 도구 호출 직전에도 다시 읽게 됩니다.
+
+1. **데일리 노트 제목은 ordinal suffix 필수**: `April 16th, 2026` ✅ / `April 16, 2026` ❌
+   Roam은 접미사 유무에 따라 완전히 다른 페이지로 취급합니다.
+
+2. **"오늘"에 쓸 때는 `page` 인자를 생략**. `roam_add_todo` 와 `roam_create_block` 둘 다 `page` 미지정 시 서버가 올바른 형식으로 오늘 데일리 노트 제목을 계산해서 사용합니다.
+
+3. **`roam_create_page` 로 오늘 데일리 노트를 만들지 않음**. 데일리 노트는 `roam_add_todo` / `roam_create_block` 이 쓰기 시 자동 생성합니다.
+
+4. **방어적 정규화**: LLM이 실수로 `April 16, 2026` 형식을 넘겨도 서버가 `April 16th, 2026` 으로 자동 교정합니다. 하지만 이건 안전망이고, LLM이 처음부터 올바른 형식으로 넘기는 것이 선호됩니다.
 
 ## 트러블슈팅
 
