@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  deploy:
+    name: Deploy and verify
+    needs: typecheck
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - name: Deploy to Cloudflare Workers
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+          secrets: |
+            ROAM_API_TOKEN
+        env:
+          ROAM_API_TOKEN: ${{ secrets.ROAM_API_TOKEN }}
+
+      - name: Smoke test /check endpoint
+        env:
+          # wrangler-action exposes the deployed URL; fall back to the
+          # repo-level variable WORKER_URL if the output is unavailable.
+          DEPLOY_URL: ${{ steps.deploy.outputs.deployment-url }}
+          FALLBACK_URL: ${{ vars.WORKER_URL }}
+        run: |
+          set -euo pipefail
+          URL="${DEPLOY_URL:-$FALLBACK_URL}"
+          if [ -z "$URL" ]; then
+            echo "No deployment URL available. Set the WORKER_URL repo variable (e.g. https://roam-mcp.<account>.workers.dev) as a fallback." >&2
+            exit 1
+          fi
+          echo "Checking $URL/check"
+          # Retry a few times — Cloudflare propagation can take a moment.
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -fsS "$URL/check" || true)
+            if [ -n "$RESPONSE" ]; then
+              echo "$RESPONSE"
+              if echo "$RESPONSE" | grep -q '"ok":true'; then
+                echo "Smoke test passed."
+                exit 0
+              fi
+            fi
+            echo "Attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+          echo "Smoke test failed: /check did not return ok:true" >&2
+          exit 1
