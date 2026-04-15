@@ -169,6 +169,33 @@ npm run dev
 curl http://localhost:8787/check
 ```
 
+## CI/CD (GitHub Actions)
+
+`.github/workflows/ci.yml` 이 포함되어 있습니다:
+
+- **PR**: `tsc --noEmit` 타입 체크만 수행
+- **main 푸시**: 타입 체크 → `wrangler deploy` → `/check` 스모크 테스트
+
+배포 결과가 성공으로 찍혀도 토큰이 깨진 상태면 `/check` 가 실패하므로 워크플로 전체가 실패 처리됩니다.
+
+### 필요한 GitHub Secrets
+
+리포지토리 **Settings → Secrets and variables → Actions → Secrets** 에 등록:
+
+| 이름 | 값 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare Dashboard → My Profile → API Tokens → Create Token → "Edit Cloudflare Workers" 템플릿 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard 우측 사이드바의 Account ID |
+| `ROAM_API_TOKEN` | Roam API 토큰 (`roam-graph-token-...`). 배포 시마다 Worker secret으로 자동 동기화됨 |
+
+### 필요한 GitHub Variables (선택)
+
+**Settings → Secrets and variables → Actions → Variables** 에 등록:
+
+| 이름 | 값 |
+|---|---|
+| `WORKER_URL` | `https://roam-mcp.<your-account>.workers.dev` — `wrangler-action` 이 deployment URL을 반환하지 못할 때 스모크 테스트에서 사용 |
+
 ## 제공 도구
 
 | 도구 | 설명 |
