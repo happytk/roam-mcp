@@ -87,6 +87,30 @@ function normalizePageTitle(title: string): string {
   return `${month} ${day}${ordinalSuffix(day)}, ${year}`;
 }
 
+// Recursively create a subtree of blocks under a given parent uid. Each node
+// is { content: string, children?: Node[] }. Every created block is tagged
+// with #ai and its uid appended to `createdUids` for the response.
+async function createChildrenTree(
+  env: Env,
+  parentUid: string,
+  nodes: any[],
+  createdUids: string[]
+): Promise<void> {
+  for (const node of nodes) {
+    if (!node || typeof node.content !== "string") continue;
+    const childUid = uid();
+    await roamWrite(env, {
+      action: "create-block",
+      location: { "parent-uid": parentUid, order: "last" },
+      block: { string: `${node.content} #ai`, uid: childUid },
+    });
+    createdUids.push(childUid);
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      await createChildrenTree(env, childUid, node.children, createdUids);
+    }
+  }
+}
+
 // --- Server-level instructions (sent in MCP initialize response) ---
 
 const ROAM_INSTRUCTIONS = `This server writes to a Roam Research graph.
@@ -110,6 +134,24 @@ Roam conventions you MUST follow:
    (e.g. "March 3rd, 2026", "January 1st, 2026"). The server normalizes common
    mistakes like "March 3, 2026" as a safety net, but explicit correct formatting
    is preferred.
+
+5. OUTLINER STRUCTURE — Roam is an outliner, not a document editor. Multi-item or
+   hierarchical content MUST be written as a tree of short blocks, not as one long
+   block with line breaks or bullets inside it, and not as a flat run of sibling
+   blocks when the items logically nest.
+
+   Rules of thumb:
+   - One idea per block. If a block contains a list, multiple sentences on different
+     topics, or markdown bullets/numbering inside a single string, split it.
+   - Use parent/child nesting to express structure (topic → sub-points → details,
+     task → sub-tasks, question → answer points). Do NOT fake hierarchy with "-" or
+     indentation inside a single block.
+   - Use the \`children\` argument on \`roam_create_block\` to create a whole subtree
+     in one call. For adding under an existing block, pass its uid as \`parent_uid\`.
+     Both \`roam_create_block\` and \`roam_add_todo\` return the created block's \`uid\`
+     so you can chain follow-up calls.
+   - Keep nesting consistent: don't mix "everything in one block" and "deep tree"
+     in the same write. Pick the right depth for the content and apply it uniformly.
 
 All blocks and new pages created via this server are automatically tagged with #ai
 so the user can distinguish AI-generated content from their own notes.`;
@@ -196,15 +238,20 @@ const TOOLS = [
   {
     name: "roam_add_todo",
     description:
-      "Add a TODO block to a page. Defaults to today's daily note when `page` is omitted — this is the correct way to add to today. Do NOT pass today's date as `page`; omit it instead.",
+      "Add a TODO block. Defaults to today's daily note when `page` is omitted — this is the correct way to add to today. Do NOT pass today's date as `page`; omit it instead. Returns the created block's `uid` so you can nest sub-tasks under it using `parent_uid`.",
     inputSchema: {
       type: "object",
       properties: {
-        task: { type: "string", description: "Task description" },
+        task: { type: "string", description: "Task description (one idea per block — split multi-step tasks into parent + children instead of cramming into one string)" },
         page: {
           type: "string",
           description:
-            "Target page title. Omit to use today's daily note (preferred for 'today'). If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'.",
+            "Target page title. Omit to use today's daily note (preferred for 'today'). If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'. Ignored when `parent_uid` is provided.",
+        },
+        parent_uid: {
+          type: "string",
+          description:
+            "If set, nest this TODO under an existing block instead of appending to a page. Use this to build hierarchy (e.g. sub-tasks under a parent task).",
         },
       },
       required: ["task"],
@@ -213,16 +260,31 @@ const TOOLS = [
   {
     name: "roam_create_block",
     description:
-      "Append a text block to a page. Defaults to today's daily note when `page` is omitted. Do NOT pass today's date as `page`; omit it instead.",
+      "Append a text block to a page or nest it under an existing block. Defaults to today's daily note when both `page` and `parent_uid` are omitted. IMPORTANT: Roam is an outliner — for multi-item or hierarchical content, pass a `children` tree (one idea per block, nested by structure) rather than stuffing bullets/newlines into a single `content` string. Returns the created block's `uid` for chaining.",
     inputSchema: {
       type: "object",
       properties: {
         page: {
           type: "string",
           description:
-            "Target page title. Omit to use today's daily note (preferred for 'today'). If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'.",
+            "Target page title. Omit to use today's daily note. If specifying a daily note explicitly, use ordinal format like 'April 16th, 2026'. Ignored when `parent_uid` is provided.",
         },
-        content: { type: "string", description: "Block content (supports Roam markdown)" },
+        parent_uid: {
+          type: "string",
+          description:
+            "If set, create this block as a child of an existing block (by uid) instead of appending to a page. Use this to build hierarchy across multiple calls.",
+        },
+        content: {
+          type: "string",
+          description:
+            "Block content (supports Roam markdown). Keep it to one idea — if you find yourself writing bullets, numbered lists, or multiple topics in one string, split into `children` instead.",
+        },
+        children: {
+          type: "array",
+          description:
+            "Optional nested subtree. Each item is { content: string, children?: [...] }. The whole tree is created in one call and tagged with #ai. Prefer this over many flat calls when the content has natural hierarchy.",
+          items: { type: "object" },
+        },
       },
       required: ["content"],
     },
@@ -323,25 +385,46 @@ async function callTool(
     }
 
     case "roam_add_todo": {
-      const { task } = args;
+      const { task, parent_uid } = args;
+      const blockUid = uid();
+      if (parent_uid) {
+        await roamWrite(env, {
+          action: "create-block",
+          location: { "parent-uid": parent_uid, order: "last" },
+          block: { string: `{{[[TODO]]}} ${task} #ai`, uid: blockUid },
+        });
+        return JSON.stringify({ success: true, uid: blockUid, parent_uid });
+      }
       const pageTitle = args.page ? normalizePageTitle(args.page) : todayPageTitle();
       await roamWrite(env, {
         action: "create-block",
         location: { "page-title": pageTitle, order: "last" },
-        block: { string: `{{[[TODO]]}} ${task} #ai`, uid: uid() },
+        block: { string: `{{[[TODO]]}} ${task} #ai`, uid: blockUid },
       });
-      return JSON.stringify({ success: true, page: pageTitle });
+      return JSON.stringify({ success: true, uid: blockUid, page: pageTitle });
     }
 
     case "roam_create_block": {
-      const { content } = args;
-      const pageTitle = args.page ? normalizePageTitle(args.page) : todayPageTitle();
+      const { content, parent_uid, children } = args;
+      const rootUid = uid();
+      const location = parent_uid
+        ? { "parent-uid": parent_uid, order: "last" }
+        : { "page-title": args.page ? normalizePageTitle(args.page) : todayPageTitle(), order: "last" };
       await roamWrite(env, {
         action: "create-block",
-        location: { "page-title": pageTitle, order: "last" },
-        block: { string: `${content} #ai`, uid: uid() },
+        location,
+        block: { string: `${content} #ai`, uid: rootUid },
       });
-      return JSON.stringify({ success: true, page: pageTitle });
+      const createdUids: string[] = [rootUid];
+      if (Array.isArray(children) && children.length > 0) {
+        await createChildrenTree(env, rootUid, children, createdUids);
+      }
+      return JSON.stringify({
+        success: true,
+        uid: rootUid,
+        ...(parent_uid ? { parent_uid } : { page: (location as any)["page-title"] }),
+        ...(createdUids.length > 1 ? { created_uids: createdUids } : {}),
+      });
     }
 
     case "roam_datomic_query": {
