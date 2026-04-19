@@ -260,7 +260,7 @@ const TOOLS = [
   {
     name: "roam_create_block",
     description:
-      "Append a text block to a page or nest it under an existing block. Defaults to today's daily note when both `page` and `parent_uid` are omitted. IMPORTANT: Roam is an outliner — for multi-item or hierarchical content, pass a `children` tree (one idea per block, nested by structure) rather than stuffing bullets/newlines into a single `content` string. Returns the created block's `uid` for chaining.",
+      "Append a text block to a page, or nest it under an existing block. Defaults to today's daily note when both `page` and `parent_uid` are omitted. IMPORTANT: Roam is an outliner — for multi-item or hierarchical content, pass a `children` tree (one idea per block, nested by structure) rather than stuffing bullets/newlines into a single `content` string. Returns the created block's `uid`, plus `created_uids` when `children` is used.\n\nExample for a list with sub-points:\n  { content: \"Release notes\", children: [\n    { content: \"Backend\", children: [\n      { content: \"fix race condition in queue\" },\n      { content: \"bump node to 20\" }\n    ]},\n    { content: \"Frontend\", children: [\n      { content: \"dark mode toggle\" }\n    ]}\n  ]}",
     inputSchema: {
       type: "object",
       properties: {
@@ -277,13 +277,34 @@ const TOOLS = [
         content: {
           type: "string",
           description:
-            "Block content (supports Roam markdown). Keep it to one idea — if you find yourself writing bullets, numbered lists, or multiple topics in one string, split into `children` instead.",
+            "Root block text (supports Roam markdown). Keep it to one idea — if you have multiple items, put them in `children` instead of concatenating with newlines/bullets.",
         },
         children: {
           type: "array",
           description:
-            "Optional nested subtree. Each item is { content: string, children?: [...] }. The whole tree is created in one call and tagged with #ai. Prefer this over many flat calls when the content has natural hierarchy.",
-          items: { type: "object" },
+            "Nested subtree created in one call. Each node has the shape { content: string, children?: Node[] } and can nest arbitrarily deep. Prefer this over multiple flat calls for any content with natural hierarchy (lists, outlines, topic+details, task+sub-tasks).",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string", description: "Block text" },
+              children: {
+                type: "array",
+                description: "Further nested children (same { content, children? } shape; recurses).",
+                items: {
+                  type: "object",
+                  properties: {
+                    content: { type: "string" },
+                    children: {
+                      type: "array",
+                      items: { type: "object", properties: { content: { type: "string" } }, required: ["content"] },
+                    },
+                  },
+                  required: ["content"],
+                },
+              },
+            },
+            required: ["content"],
+          },
         },
       },
       required: ["content"],
