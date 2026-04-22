@@ -88,8 +88,9 @@ function normalizePageTitle(title: string): string {
 }
 
 // Recursively create a subtree of blocks under a given parent uid. Each node
-// is { content: string, children?: Node[] }. Every created block is tagged
-// with #ai and its uid appended to `createdUids` for the response.
+// is { content: string, children?: Node[] }. Children are NOT tagged with #ai
+// — the caller's root block already carries the tag, which is enough to mark
+// the whole subtree as AI-generated without cluttering every descendant.
 async function createChildrenTree(
   env: Env,
   parentUid: string,
@@ -102,7 +103,7 @@ async function createChildrenTree(
     await roamWrite(env, {
       action: "create-block",
       location: { "parent-uid": parentUid, order: "last" },
-      block: { string: `${node.content} #ai`, uid: childUid },
+      block: { string: node.content, uid: childUid },
     });
     createdUids.push(childUid);
     if (Array.isArray(node.children) && node.children.length > 0) {
@@ -153,8 +154,10 @@ Roam conventions you MUST follow:
    - Keep nesting consistent: don't mix "everything in one block" and "deep tree"
      in the same write. Pick the right depth for the content and apply it uniformly.
 
-All blocks and new pages created via this server are automatically tagged with #ai
-so the user can distinguish AI-generated content from their own notes.`;
+The top-level block of every write (and new pages) is automatically tagged with #ai
+so the user can distinguish AI-generated content from their own notes. Nested
+children created via the \`children\` argument are NOT tagged individually —
+the root's tag already marks the whole subtree.`;
 
 // --- Tool definitions ---
 
