@@ -463,10 +463,22 @@ async function callTool(
 
 // --- MCP JSON-RPC handler ---
 
+function resolveEnv(request: Request, env: Env): Env {
+  const graph = request.headers.get("X-Roam-Graph");
+  const token = request.headers.get("X-Roam-Token")
+    ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+  return {
+    ROAM_GRAPH_NAME: graph ?? env.ROAM_GRAPH_NAME,
+    ROAM_API_TOKEN: token ?? env.ROAM_API_TOKEN,
+  };
+}
+
 async function handleMCP(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
+
+  const effectiveEnv = resolveEnv(request, env);
 
   let body: any;
   try {
@@ -498,7 +510,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
         id,
         result: {
           protocolVersion,
-          serverInfo: { name: "roam-research", version: "1.0.0" },
+          serverInfo: { name: `roam-research:${effectiveEnv.ROAM_GRAPH_NAME}`, version: "1.0.0" },
           capabilities: { tools: { listChanged: false } },
           instructions: ROAM_INSTRUCTIONS,
         },
@@ -515,7 +527,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
 
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params;
-      const text = await callTool(env, name, args);
+      const text = await callTool(effectiveEnv, name, args);
       return Response.json({
         jsonrpc: "2.0",
         id,
@@ -573,14 +585,15 @@ export default {
       // Setup diagnostics: GET /check actually hits the Roam API to verify
       // that the token + graph name are configured correctly.
       if (url.pathname === "/check") {
-        const hasToken = !!env.ROAM_API_TOKEN;
-        const tokenPrefix = env.ROAM_API_TOKEN?.slice(0, 17) ?? "";
+        const checkEnv = resolveEnv(request, env);
+        const hasToken = !!checkEnv.ROAM_API_TOKEN;
+        const tokenPrefix = checkEnv.ROAM_API_TOKEN?.slice(0, 17) ?? "";
         const tokenLooksValid = tokenPrefix.startsWith("roam-graph-token-");
         if (!hasToken) {
           return withCors(Response.json({
             ok: false,
             stage: "token",
-            error: "ROAM_API_TOKEN secret is not set. Run: npx wrangler secret put ROAM_API_TOKEN",
+            error: "ROAM_API_TOKEN is not set. Pass X-Roam-Token header or set the secret.",
           }, { status: 500 }));
         }
         if (!tokenLooksValid) {
@@ -591,14 +604,13 @@ export default {
           }, { status: 500 }));
         }
         try {
-          // Minimal query: just fetch one page title to confirm auth works.
           const result = await roamQuery(
-            env,
+            checkEnv,
             "[:find ?title :where [?p :node/title ?title] :limit 1]"
           );
           return withCors(Response.json({
             ok: true,
-            graph: env.ROAM_GRAPH_NAME,
+            graph: checkEnv.ROAM_GRAPH_NAME,
             message: "Token and graph name are valid. Roam API responded successfully.",
             sampleCount: result.result?.length ?? 0,
           }));
@@ -606,9 +618,9 @@ export default {
           return withCors(Response.json({
             ok: false,
             stage: "roam-api",
-            graph: env.ROAM_GRAPH_NAME,
+            graph: checkEnv.ROAM_GRAPH_NAME,
             error: String(err),
-            hint: "Check that ROAM_GRAPH_NAME in wrangler.toml matches your graph exactly, and that the token belongs to that graph.",
+            hint: "Check that the graph name matches your token.",
           }, { status: 500 }));
         }
       }
