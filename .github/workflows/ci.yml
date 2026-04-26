@@ -42,8 +42,10 @@ jobs:
           command: deploy
           secrets: |
             ROAM_API_TOKEN
+            ROAM_GRAPH_NAME
         env:
           ROAM_API_TOKEN: ${{ secrets.ROAM_API_TOKEN }}
+          ROAM_GRAPH_NAME: ${{ secrets.ROAM_GRAPH_NAME }}
 
       - name: Smoke test /check endpoint
         env:

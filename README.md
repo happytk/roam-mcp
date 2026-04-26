@@ -41,14 +41,15 @@ npx wrangler login
 
 ### 3. 그래프 이름 설정
 
-`wrangler.toml`의 `ROAM_GRAPH_NAME` 값을 본인 그래프 이름으로 수정합니다.
+그래프 이름은 secret으로 등록합니다. (5단계의 토큰과 같은 방식)
 
-```toml
-[vars]
-ROAM_GRAPH_NAME = "your-graph-name"
+```bash
+npx wrangler secret put ROAM_GRAPH_NAME
 ```
 
 > 그래프 이름은 Roam URL `roamresearch.com/#/app/<graph-name>` 의 `<graph-name>` 과 정확히 일치해야 합니다. 대소문자와 하이픈까지 동일해야 합니다.
+
+이 값은 폴백입니다. 요청 시 `X-Roam-Graph` 헤더를 보내면 헤더 값이 우선 적용되므로, 한 Worker로 여러 그래프를 다룰 수도 있습니다. 헤더도 secret도 없으면 호출이 에러로 거부됩니다 (예전처럼 `happytk` 같은 하드코딩 기본값은 사용하지 않습니다).
 
 ### 4. 최초 배포 (Worker 생성)
 
@@ -116,6 +117,25 @@ curl https://roam-mcp.{your-account}.workers.dev/
 
 curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
   -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+## 요청 헤더 (per-request override)
+
+매 요청마다 헤더로 그래프/토큰/옵션을 전달할 수 있습니다. 헤더가 없으면 환경변수 폴백을 사용합니다.
+
+| 헤더 | 의미 | 기본값 |
+|---|---|---|
+| `X-Roam-Graph` | 그래프 이름 | `ROAM_GRAPH_NAME` 환경변수 (없으면 에러) |
+| `X-Roam-Token` | API 토큰 (`Authorization: Bearer ...` 도 허용) | `ROAM_API_TOKEN` 시크릿 (없으면 에러) |
+| `X-Roam-Ai-Tag` | 루트 블록·신규 페이지에 `#ai` 자동 태그 부착 여부. `false`/`0`/`off`/`no` 면 끔 | `true` (켜짐) |
+
+```bash
+curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Roam-Graph: my-graph" \
+  -H "X-Roam-Token: roam-graph-token-..." \
+  -H "X-Roam-Ai-Tag: false" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
@@ -187,6 +207,7 @@ curl http://localhost:8787/check
 | `CLOUDFLARE_API_TOKEN` | Cloudflare Dashboard → My Profile → API Tokens → Create Token → "Edit Cloudflare Workers" 템플릿 |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard 우측 사이드바의 Account ID |
 | `ROAM_API_TOKEN` | Roam API 토큰 (`roam-graph-token-...`). 배포 시마다 Worker secret으로 자동 동기화됨 |
+| `ROAM_GRAPH_NAME` | 그래프 이름. 배포 시마다 Worker secret으로 자동 동기화됨 |
 
 ### 필요한 GitHub Variables (선택)
 

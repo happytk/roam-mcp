@@ -1,13 +1,29 @@
 interface Env {
+  ROAM_API_TOKEN?: string;
+  ROAM_GRAPH_NAME?: string;
+}
+
+interface EffectiveEnv {
   ROAM_API_TOKEN: string;
   ROAM_GRAPH_NAME: string;
+  aiTag: boolean;
 }
 
 const ROAM_API_BASE = "https://api.roamresearch.com/api/graph";
 
+function requireConfig(env: EffectiveEnv): void {
+  if (!env.ROAM_GRAPH_NAME) {
+    throw new Error("ROAM_GRAPH_NAME is not set. Pass X-Roam-Graph header.");
+  }
+  if (!env.ROAM_API_TOKEN) {
+    throw new Error("ROAM_API_TOKEN is not set. Pass X-Roam-Token header (or Authorization: Bearer ...).");
+  }
+}
+
 // --- Roam API helpers ---
 
-async function roamQuery(env: Env, query: string): Promise<any> {
+async function roamQuery(env: EffectiveEnv, query: string): Promise<any> {
+  requireConfig(env);
   const res = await fetch(`${ROAM_API_BASE}/${env.ROAM_GRAPH_NAME}/q`, {
     method: "POST",
     headers: {
@@ -23,7 +39,8 @@ async function roamQuery(env: Env, query: string): Promise<any> {
   return res.json();
 }
 
-async function roamWrite(env: Env, action: object): Promise<any> {
+async function roamWrite(env: EffectiveEnv, action: object): Promise<any> {
+  requireConfig(env);
   const res = await fetch(`${ROAM_API_BASE}/${env.ROAM_GRAPH_NAME}/write`, {
     method: "POST",
     headers: {
@@ -92,7 +109,7 @@ function normalizePageTitle(title: string): string {
 // — the caller's root block already carries the tag, which is enough to mark
 // the whole subtree as AI-generated without cluttering every descendant.
 async function createChildrenTree(
-  env: Env,
+  env: EffectiveEnv,
   parentUid: string,
   nodes: any[],
   createdUids: string[]
@@ -114,7 +131,18 @@ async function createChildrenTree(
 
 // --- Server-level instructions (sent in MCP initialize response) ---
 
-const ROAM_INSTRUCTIONS = `This server writes to a Roam Research graph.
+function roamInstructions(aiTag: boolean): string {
+  const tagSection = aiTag
+    ? `The top-level block of every write (and new pages) is automatically tagged with #ai
+so the user can distinguish AI-generated content from their own notes. Nested
+children created via the \`children\` argument are NOT tagged individually —
+the root's tag already marks the whole subtree.`
+    : `The #ai auto-tagging is DISABLED for this session (X-Roam-Ai-Tag: false).
+Blocks created by these tools will not carry a #ai marker.`;
+  return ROAM_INSTRUCTIONS_BODY + "\n\n" + tagSection;
+}
+
+const ROAM_INSTRUCTIONS_BODY = `This server writes to a Roam Research graph.
 
 Roam conventions you MUST follow:
 
@@ -152,12 +180,7 @@ Roam conventions you MUST follow:
      Both \`roam_create_block\` and \`roam_add_todo\` return the created block's \`uid\`
      so you can chain follow-up calls.
    - Keep nesting consistent: don't mix "everything in one block" and "deep tree"
-     in the same write. Pick the right depth for the content and apply it uniformly.
-
-The top-level block of every write (and new pages) is automatically tagged with #ai
-so the user can distinguish AI-generated content from their own notes. Nested
-children created via the \`children\` argument are NOT tagged individually —
-the root's tag already marks the whole subtree.`;
+     in the same write. Pick the right depth for the content and apply it uniformly.`;
 
 // --- Tool definitions ---
 
@@ -329,7 +352,7 @@ const TOOLS = [
 // --- Tool handlers ---
 
 async function callTool(
-  env: Env,
+  env: EffectiveEnv,
   name: string,
   args: Record<string, any>
 ): Promise<string> {
@@ -400,22 +423,25 @@ async function callTool(
         action: "create-page",
         page: { title, uid: uid() },
       });
-      await roamWrite(env, {
-        action: "create-block",
-        location: { "page-title": title, order: 0 },
-        block: { string: "#ai", uid: uid() },
-      });
+      if (env.aiTag) {
+        await roamWrite(env, {
+          action: "create-block",
+          location: { "page-title": title, order: 0 },
+          block: { string: "#ai", uid: uid() },
+        });
+      }
       return JSON.stringify({ success: true, message: `Page "${title}" created` });
     }
 
     case "roam_add_todo": {
       const { task, parent_uid } = args;
       const blockUid = uid();
+      const tagSuffix = env.aiTag ? " #ai" : "";
       if (parent_uid) {
         await roamWrite(env, {
           action: "create-block",
           location: { "parent-uid": parent_uid, order: "last" },
-          block: { string: `{{[[TODO]]}} ${task} #ai`, uid: blockUid },
+          block: { string: `{{[[TODO]]}} ${task}${tagSuffix}`, uid: blockUid },
         });
         return JSON.stringify({ success: true, uid: blockUid, parent_uid });
       }
@@ -423,7 +449,7 @@ async function callTool(
       await roamWrite(env, {
         action: "create-block",
         location: { "page-title": pageTitle, order: "last" },
-        block: { string: `{{[[TODO]]}} ${task} #ai`, uid: blockUid },
+        block: { string: `{{[[TODO]]}} ${task}${tagSuffix}`, uid: blockUid },
       });
       return JSON.stringify({ success: true, uid: blockUid, page: pageTitle });
     }
@@ -434,10 +460,11 @@ async function callTool(
       const location = parent_uid
         ? { "parent-uid": parent_uid, order: "last" }
         : { "page-title": args.page ? normalizePageTitle(args.page) : todayPageTitle(), order: "last" };
+      const tagSuffix = env.aiTag ? " #ai" : "";
       await roamWrite(env, {
         action: "create-block",
         location,
-        block: { string: `${content} #ai`, uid: rootUid },
+        block: { string: `${content}${tagSuffix}`, uid: rootUid },
       });
       const createdUids: string[] = [rootUid];
       if (Array.isArray(children) && children.length > 0) {
@@ -463,13 +490,25 @@ async function callTool(
 
 // --- MCP JSON-RPC handler ---
 
-function resolveEnv(request: Request, env: Env): Env {
-  const graph = request.headers.get("X-Roam-Graph");
+function parseBoolHeader(value: string | null, defaultVal: boolean): boolean {
+  if (value === null) return defaultVal;
+  const v = value.trim().toLowerCase();
+  if (v === "false" || v === "0" || v === "off" || v === "no") return false;
+  if (v === "true" || v === "1" || v === "on" || v === "yes") return true;
+  return defaultVal;
+}
+
+function resolveEnv(request: Request, env: Env): EffectiveEnv {
+  const graph = request.headers.get("X-Roam-Graph") ?? env.ROAM_GRAPH_NAME ?? "";
   const token = request.headers.get("X-Roam-Token")
-    ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+    ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "")
+    ?? env.ROAM_API_TOKEN
+    ?? "";
+  const aiTag = parseBoolHeader(request.headers.get("X-Roam-Ai-Tag"), true);
   return {
-    ROAM_GRAPH_NAME: graph ?? env.ROAM_GRAPH_NAME,
-    ROAM_API_TOKEN: token ?? env.ROAM_API_TOKEN,
+    ROAM_GRAPH_NAME: graph,
+    ROAM_API_TOKEN: token,
+    aiTag,
   };
 }
 
@@ -512,7 +551,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
           protocolVersion,
           serverInfo: { name: "roam-research", version: "1.0.0" },
           capabilities: { tools: { listChanged: false } },
-          instructions: ROAM_INSTRUCTIONS,
+          instructions: roamInstructions(effectiveEnv.aiTag),
         },
       });
     }
@@ -586,9 +625,17 @@ export default {
       // that the token + graph name are configured correctly.
       if (url.pathname === "/check") {
         const checkEnv = resolveEnv(request, env);
+        const hasGraph = !!checkEnv.ROAM_GRAPH_NAME;
         const hasToken = !!checkEnv.ROAM_API_TOKEN;
         const tokenPrefix = checkEnv.ROAM_API_TOKEN?.slice(0, 17) ?? "";
         const tokenLooksValid = tokenPrefix.startsWith("roam-graph-token-");
+        if (!hasGraph) {
+          return withCors(Response.json({
+            ok: false,
+            stage: "graph",
+            error: "ROAM_GRAPH_NAME is not set. Pass X-Roam-Graph header.",
+          }, { status: 500 }));
+        }
         if (!hasToken) {
           return withCors(Response.json({
             ok: false,
@@ -629,8 +676,13 @@ export default {
         Response.json({
           status: "ok",
           server: "roam-research-mcp",
-          graph: env.ROAM_GRAPH_NAME,
+          graph: env.ROAM_GRAPH_NAME ?? null,
           tokenConfigured: !!env.ROAM_API_TOKEN,
+          headers: {
+            "X-Roam-Graph": "graph name (overrides ROAM_GRAPH_NAME)",
+            "X-Roam-Token": "API token (overrides ROAM_API_TOKEN; or use Authorization: Bearer ...)",
+            "X-Roam-Ai-Tag": "false to disable #ai auto-tag (default: on)",
+          },
         })
       );
     }
