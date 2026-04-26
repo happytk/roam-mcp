@@ -7,6 +7,8 @@ interface EffectiveEnv {
   ROAM_API_TOKEN: string;
   ROAM_GRAPH_NAME: string;
   aiTag: boolean;
+  dryRun: boolean;
+  mutate: boolean;
 }
 
 const ROAM_API_BASE = "https://api.roamresearch.com/api/graph";
@@ -40,6 +42,9 @@ async function roamQuery(env: EffectiveEnv, query: string): Promise<any> {
 }
 
 async function roamWrite(env: EffectiveEnv, action: object): Promise<any> {
+  if (env.dryRun) {
+    return { dryRun: true, action };
+  }
   requireConfig(env);
   const res = await fetch(`${ROAM_API_BASE}/${env.ROAM_GRAPH_NAME}/write`, {
     method: "POST",
@@ -131,15 +136,32 @@ async function createChildrenTree(
 
 // --- Server-level instructions (sent in MCP initialize response) ---
 
-function roamInstructions(aiTag: boolean): string {
-  const tagSection = aiTag
+function roamInstructions(env: EffectiveEnv): string {
+  const tagSection = env.aiTag
     ? `The top-level block of every write (and new pages) is automatically tagged with #ai
 so the user can distinguish AI-generated content from their own notes. Nested
 children created via the \`children\` argument are NOT tagged individually —
 the root's tag already marks the whole subtree.`
     : `The #ai auto-tagging is DISABLED for this session (X-Roam-Ai-Tag: false).
 Blocks created by these tools will not carry a #ai marker.`;
-  return ROAM_INSTRUCTIONS_BODY + "\n\n" + tagSection;
+  const sections = [tagSection];
+  if (env.mutate) {
+    sections.push(
+      `Mutation tools are ENABLED for this session (X-Roam-Mutate: true).
+roam_update_block, roam_delete_block, and roam_move_block are available.
+Be conservative: prefer roam_update_block over delete; verify uids before
+calling delete; consider X-Roam-Dry-Run for a no-op preview when uncertain.`
+    );
+  }
+  if (env.dryRun) {
+    sections.push(
+      `Dry-run mode is ENABLED for this session (X-Roam-Dry-Run: true).
+ALL writes are no-ops — no block, page, or edit will be persisted to the
+graph. Tool responses include "dry_run": true so you can detect this.
+Returned uids are synthesized and do NOT correspond to real blocks.`
+    );
+  }
+  return ROAM_INSTRUCTIONS_BODY + "\n\n" + sections.join("\n\n");
 }
 
 const ROAM_INSTRUCTIONS_BODY = `This server writes to a Roam Research graph.
@@ -349,6 +371,71 @@ const TOOLS = [
   },
 ];
 
+// Mutation tools — destructive or modify-existing-content. Hidden from
+// tools/list and refused at tools/call unless the request opts in via
+// `X-Roam-Mutate: true`. Default OFF so an LLM that hasn't been granted
+// edit permission can't even discover them.
+const MUTATE_TOOLS = [
+  {
+    name: "roam_update_block",
+    description:
+      "Replace the text of an existing block by uid. Does NOT auto-append #ai — pass the exact final content you want. Use this to edit a block you previously created (uid is returned by roam_add_todo / roam_create_block) or to fix a block found via search.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uid: { type: "string", description: "uid of the block to update" },
+        content: {
+          type: "string",
+          description:
+            "New block string (Roam markdown). Replaces the entire block content — include any markers like {{[[TODO]]}} or #ai yourself if you want them preserved.",
+        },
+      },
+      required: ["uid", "content"],
+    },
+  },
+  {
+    name: "roam_delete_block",
+    description:
+      "Delete a block by uid. The block AND all of its descendants are removed permanently — there is no undo from the API. Be conservative: prefer roam_update_block when you only need to change content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uid: { type: "string", description: "uid of the block to delete" },
+      },
+      required: ["uid"],
+    },
+  },
+  {
+    name: "roam_move_block",
+    description:
+      "Move a block under a new parent or onto a page. Provide either `parent_uid` (nest under another block) OR `page` (move to top of a page) — exactly one is required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uid: { type: "string", description: "uid of the block to move" },
+        parent_uid: {
+          type: "string",
+          description:
+            "uid of the new parent block. Mutually exclusive with `page`.",
+        },
+        page: {
+          type: "string",
+          description:
+            "Target page title (move to top level of a page). For daily notes use ordinal format like 'April 16th, 2026'. Mutually exclusive with `parent_uid`.",
+        },
+        order: {
+          description:
+            "Position under the new parent: a number (0-based index), 'first', or 'last'. Defaults to 'last'.",
+          default: "last",
+        },
+      },
+      required: ["uid"],
+    },
+  },
+];
+
+const MUTATE_TOOL_NAMES = new Set(MUTATE_TOOLS.map((t) => t.name));
+
 // --- Tool handlers ---
 
 async function callTool(
@@ -356,6 +443,11 @@ async function callTool(
   name: string,
   args: Record<string, any>
 ): Promise<string> {
+  if (MUTATE_TOOL_NAMES.has(name) && !env.mutate) {
+    throw new Error(
+      `Tool "${name}" is disabled. Mutation tools (update/delete/move) are off by default — set X-Roam-Mutate: true on the request to enable.`
+    );
+  }
   switch (name) {
     case "roam_find_pages_modified_today": {
       const midnight = new Date();
@@ -430,7 +522,11 @@ async function callTool(
           block: { string: "#ai", uid: uid() },
         });
       }
-      return JSON.stringify({ success: true, message: `Page "${title}" created` });
+      return JSON.stringify({
+        success: true,
+        message: `Page "${title}" created`,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
     }
 
     case "roam_add_todo": {
@@ -443,7 +539,12 @@ async function callTool(
           location: { "parent-uid": parent_uid, order: "last" },
           block: { string: `{{[[TODO]]}} ${task}${tagSuffix}`, uid: blockUid },
         });
-        return JSON.stringify({ success: true, uid: blockUid, parent_uid });
+        return JSON.stringify({
+          success: true,
+          uid: blockUid,
+          parent_uid,
+          ...(env.dryRun ? { dry_run: true } : {}),
+        });
       }
       const pageTitle = args.page ? normalizePageTitle(args.page) : todayPageTitle();
       await roamWrite(env, {
@@ -451,7 +552,12 @@ async function callTool(
         location: { "page-title": pageTitle, order: "last" },
         block: { string: `{{[[TODO]]}} ${task}${tagSuffix}`, uid: blockUid },
       });
-      return JSON.stringify({ success: true, uid: blockUid, page: pageTitle });
+      return JSON.stringify({
+        success: true,
+        uid: blockUid,
+        page: pageTitle,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
     }
 
     case "roam_create_block": {
@@ -475,6 +581,60 @@ async function callTool(
         uid: rootUid,
         ...(parent_uid ? { parent_uid } : { page: (location as any)["page-title"] }),
         ...(createdUids.length > 1 ? { created_uids: createdUids } : {}),
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
+    }
+
+    case "roam_update_block": {
+      const { uid: blockUid, content } = args;
+      await roamWrite(env, {
+        action: "update-block",
+        block: { uid: blockUid, string: content },
+      });
+      return JSON.stringify({
+        success: true,
+        uid: blockUid,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
+    }
+
+    case "roam_delete_block": {
+      const { uid: blockUid } = args;
+      await roamWrite(env, {
+        action: "delete-block",
+        block: { uid: blockUid },
+      });
+      return JSON.stringify({
+        success: true,
+        uid: blockUid,
+        deleted: true,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
+    }
+
+    case "roam_move_block": {
+      const { uid: blockUid, parent_uid, page, order = "last" } = args;
+      if (parent_uid && page) {
+        throw new Error("Pass either parent_uid or page, not both.");
+      }
+      if (!parent_uid && !page) {
+        throw new Error("Must pass parent_uid or page to specify the destination.");
+      }
+      const normalizedPage = page ? normalizePageTitle(page) : undefined;
+      const location = parent_uid
+        ? { "parent-uid": parent_uid, order }
+        : { "page-title": normalizedPage!, order };
+      await roamWrite(env, {
+        action: "move-block",
+        location,
+        block: { uid: blockUid },
+      });
+      return JSON.stringify({
+        success: true,
+        uid: blockUid,
+        ...(parent_uid ? { parent_uid } : { page: normalizedPage }),
+        order,
+        ...(env.dryRun ? { dry_run: true } : {}),
       });
     }
 
@@ -505,10 +665,14 @@ function resolveEnv(request: Request, env: Env): EffectiveEnv {
     ?? env.ROAM_API_TOKEN
     ?? "";
   const aiTag = parseBoolHeader(request.headers.get("X-Roam-Ai-Tag"), true);
+  const dryRun = parseBoolHeader(request.headers.get("X-Roam-Dry-Run"), false);
+  const mutate = parseBoolHeader(request.headers.get("X-Roam-Mutate"), false);
   return {
     ROAM_GRAPH_NAME: graph,
     ROAM_API_TOKEN: token,
     aiTag,
+    dryRun,
+    mutate,
   };
 }
 
@@ -551,7 +715,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
           protocolVersion,
           serverInfo: { name: "roam-research", version: "1.0.0" },
           capabilities: { tools: { listChanged: false } },
-          instructions: roamInstructions(effectiveEnv.aiTag),
+          instructions: roamInstructions(effectiveEnv),
         },
       });
     }
@@ -561,7 +725,8 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
     }
 
     if (method === "tools/list") {
-      return Response.json({ jsonrpc: "2.0", id, result: { tools: TOOLS } });
+      const tools = effectiveEnv.mutate ? [...TOOLS, ...MUTATE_TOOLS] : TOOLS;
+      return Response.json({ jsonrpc: "2.0", id, result: { tools } });
     }
 
     if (method === "tools/call") {
@@ -593,7 +758,8 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Roam-Graph, X-Roam-Token, X-Roam-Ai-Tag, X-Roam-Mutate, X-Roam-Dry-Run",
 };
 
 function withCors(res: Response): Response {
@@ -682,6 +848,8 @@ export default {
             "X-Roam-Graph": "graph name (overrides ROAM_GRAPH_NAME)",
             "X-Roam-Token": "API token (overrides ROAM_API_TOKEN; or use Authorization: Bearer ...)",
             "X-Roam-Ai-Tag": "false to disable #ai auto-tag (default: on)",
+            "X-Roam-Mutate": "true to expose update/delete/move tools (default: off)",
+            "X-Roam-Dry-Run": "true to make every write a no-op (default: off)",
           },
         })
       );

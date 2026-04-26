@@ -129,6 +129,8 @@ curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
 | `X-Roam-Graph` | 그래프 이름 | `ROAM_GRAPH_NAME` 환경변수 (없으면 에러) |
 | `X-Roam-Token` | API 토큰 (`Authorization: Bearer ...` 도 허용) | `ROAM_API_TOKEN` 시크릿 (없으면 에러) |
 | `X-Roam-Ai-Tag` | 루트 블록·신규 페이지에 `#ai` 자동 태그 부착 여부. `false`/`0`/`off`/`no` 면 끔 | `true` (켜짐) |
+| `X-Roam-Mutate` | `true`/`1`/`on`/`yes` 면 update/delete/move 도구를 노출. 끄면 `tools/list`에서도 숨겨지고 호출도 거부됨 | `false` (꺼짐) |
+| `X-Roam-Dry-Run` | `true`이면 모든 쓰기 호출이 no-op이 되고 응답에 `dry_run: true` 포함. 권한 검증/사전 시뮬레이션 용도 | `false` (꺼짐) |
 
 ```bash
 curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
@@ -229,7 +231,12 @@ curl http://localhost:8787/check
 | `roam_create_page` | 새 페이지 생성 (데일리 노트에는 사용 금지) |
 | `roam_add_todo` | TODO 항목 추가 (`page` 생략 시 오늘 데일리 노트) |
 | `roam_create_block` | 블록 추가 (`page` 생략 시 오늘 데일리 노트) |
+| `roam_update_block` ⚑ | 기존 블록 텍스트 교체 (uid 기반) |
+| `roam_delete_block` ⚑ | 블록과 그 자식들 영구 삭제 |
+| `roam_move_block` ⚑ | 블록을 다른 부모/페이지로 이동 |
 | `roam_datomic_query` | 직접 Datalog 쿼리 실행 |
+
+⚑ 표시는 mutate 도구 — 기본 OFF. 요청에 `X-Roam-Mutate: true` 헤더를 보내야 노출되고 호출 가능. dry-run 시뮬레이션은 `X-Roam-Dry-Run: true` 헤더로.
 
 ## LLM이 지켜야 할 Roam 컨벤션
 
