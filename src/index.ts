@@ -65,6 +65,13 @@ async function roamWrite(env: EffectiveEnv, action: object): Promise<any> {
   }
 }
 
+async function findPageUid(env: EffectiveEnv, title: string): Promise<string | null> {
+  const query =
+    `[:find ?uid :where [?p :node/title "${esc(title)}"] [?p :block/uid ?uid]]`;
+  const result = await roamQuery(env, query);
+  return result.result?.[0]?.[0] ?? null;
+}
+
 function uid(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   return Array.from({ length: 9 }, () =>
@@ -432,6 +439,48 @@ const MUTATE_TOOLS = [
       required: ["uid"],
     },
   },
+  {
+    name: "roam_rename_page",
+    description:
+      "Rename a page. Identify it by `title` (current title) or `uid`; pass `new_title` for the new name. Daily notes use ordinal format like 'April 16th, 2026' for both old and new titles.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description:
+            "Current page title. Mutually exclusive with `uid` (one is required).",
+        },
+        uid: {
+          type: "string",
+          description:
+            "Page uid (skip the title→uid lookup). Mutually exclusive with `title`.",
+        },
+        new_title: { type: "string", description: "New page title." },
+      },
+      required: ["new_title"],
+    },
+  },
+  {
+    name: "roam_delete_page",
+    description:
+      "Delete a page and ALL its blocks permanently. Be VERY conservative — this is much higher blast radius than roam_delete_block. Identify by `title` or `uid`. Daily notes are deletable too, so double-check the title.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description:
+            "Page title to delete. Mutually exclusive with `uid` (one is required). For daily notes use ordinal format.",
+        },
+        uid: {
+          type: "string",
+          description:
+            "Page uid (skip the title→uid lookup). Mutually exclusive with `title`.",
+        },
+      },
+    },
+  },
 ];
 
 const MUTATE_TOOL_NAMES = new Set(MUTATE_TOOLS.map((t) => t.name));
@@ -634,6 +683,68 @@ async function callTool(
         uid: blockUid,
         ...(parent_uid ? { parent_uid } : { page: normalizedPage }),
         order,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
+    }
+
+    case "roam_rename_page": {
+      const { title, uid: argUid, new_title } = args;
+      if (title && argUid) {
+        throw new Error("Pass either title or uid, not both.");
+      }
+      if (!title && !argUid) {
+        throw new Error("Must pass title or uid to identify the page.");
+      }
+      if (!new_title) {
+        throw new Error("new_title is required.");
+      }
+      const fromTitle = title ? normalizePageTitle(title) : undefined;
+      const toTitle = normalizePageTitle(new_title);
+      let pageUid = argUid;
+      if (!pageUid) {
+        pageUid = await findPageUid(env, fromTitle!);
+        if (!pageUid) {
+          throw new Error(`Page "${fromTitle}" not found`);
+        }
+      }
+      await roamWrite(env, {
+        action: "update-page",
+        page: { uid: pageUid, title: toTitle },
+      });
+      return JSON.stringify({
+        success: true,
+        uid: pageUid,
+        ...(fromTitle ? { from: fromTitle } : {}),
+        to: toTitle,
+        ...(env.dryRun ? { dry_run: true } : {}),
+      });
+    }
+
+    case "roam_delete_page": {
+      const { title, uid: argUid } = args;
+      if (title && argUid) {
+        throw new Error("Pass either title or uid, not both.");
+      }
+      if (!title && !argUid) {
+        throw new Error("Must pass title or uid to identify the page.");
+      }
+      const normalizedTitle = title ? normalizePageTitle(title) : undefined;
+      let pageUid = argUid;
+      if (!pageUid) {
+        pageUid = await findPageUid(env, normalizedTitle!);
+        if (!pageUid) {
+          throw new Error(`Page "${normalizedTitle}" not found`);
+        }
+      }
+      await roamWrite(env, {
+        action: "delete-page",
+        page: { uid: pageUid },
+      });
+      return JSON.stringify({
+        success: true,
+        uid: pageUid,
+        ...(normalizedTitle ? { title: normalizedTitle } : {}),
+        deleted: true,
         ...(env.dryRun ? { dry_run: true } : {}),
       });
     }

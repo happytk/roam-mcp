@@ -234,6 +234,8 @@ curl http://localhost:8787/check
 | `roam_update_block` ⚑ | 기존 블록 텍스트 교체 (uid 기반) |
 | `roam_delete_block` ⚑ | 블록과 그 자식들 영구 삭제 |
 | `roam_move_block` ⚑ | 블록을 다른 부모/페이지로 이동 |
+| `roam_rename_page` ⚑ | 페이지 제목 변경 |
+| `roam_delete_page` ⚑ | 페이지와 모든 블록을 영구 삭제 (블록 삭제보다 파급 큼) |
 | `roam_datomic_query` | 직접 Datalog 쿼리 실행 |
 
 ⚑ 표시는 mutate 도구 — 기본 OFF. 요청에 `X-Roam-Mutate: true` 헤더를 보내야 노출되고 호출 가능. dry-run 시뮬레이션은 `X-Roam-Dry-Run: true` 헤더로.
