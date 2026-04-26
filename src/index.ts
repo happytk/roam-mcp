@@ -510,7 +510,7 @@ async function handleMCP(request: Request, env: Env): Promise<Response> {
         id,
         result: {
           protocolVersion,
-          serverInfo: { name: `roam-research:${effectiveEnv.ROAM_GRAPH_NAME}`, version: "1.0.0" },
+          serverInfo: { name: "roam-research", version: "1.0.0" },
           capabilities: { tools: { listChanged: false } },
           instructions: ROAM_INSTRUCTIONS,
         },
