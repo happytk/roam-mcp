@@ -120,13 +120,15 @@ curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-## 요청 헤더 (per-request override)
+## 요청별 설정 (per-request override)
 
-매 요청마다 헤더로 그래프/토큰/옵션을 전달할 수 있습니다. 헤더가 없으면 환경변수 폴백을 사용합니다.
+매 요청마다 그래프/토큰/옵션을 **헤더, path, query** 셋 중 어느 것으로든 전달할 수 있습니다. 우선순위는 **header > query > path > env** 입니다.
+
+### 1) 헤더 — curl, CI, Claude Desktop 등 커스텀 헤더가 가능한 클라이언트
 
 | 헤더 | 의미 | 기본값 |
 |---|---|---|
-| `X-Roam-Graph` | 그래프 이름 | `ROAM_GRAPH_NAME` 환경변수 (없으면 에러) |
+| `X-Roam-Graph` | 그래프 이름 | path → `ROAM_GRAPH_NAME` 환경변수 (없으면 에러) |
 | `X-Roam-Token` | API 토큰 (`Authorization: Bearer ...` 도 허용) | `ROAM_API_TOKEN` 시크릿 (없으면 에러) |
 | `X-Roam-Ai-Tag` | 루트 블록·신규 페이지에 `#ai` 자동 태그 부착 여부. `false`/`0`/`off`/`no` 면 끔 | `true` (켜짐) |
 | `X-Roam-Mutate` | `true`/`1`/`on`/`yes` 면 update/delete/move 도구를 노출. 끄면 `tools/list`에서도 숨겨지고 호출도 거부됨 | `false` (꺼짐) |
@@ -141,6 +143,30 @@ curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
+### 2) Path + Query — Claude.ai 커넥터처럼 커스텀 헤더를 못 보내는 클라이언트
+
+Claude.ai 의 Custom Connector UI 는 `Authorization: Bearer ...` 외 임의 헤더를 추가할 수 없습니다. 이 경우 **그래프는 path 로, 플래그는 query string 으로** 인코딩하면 헤더 방식과 동일한 결과를 얻을 수 있습니다. 한 Worker 배포에 그래프별 커넥터를 N 개 등록하는 패턴입니다.
+
+| 위치 | 키 | 의미 |
+|---|---|---|
+| path | `/g/<graph>/mcp` | 그래프 이름. `/mcp`, `/check` 모두 `/g/<graph>/` 프리픽스 아래에서 동작 |
+| query | `?graph=<graph>` | path 대신 query 로도 그래프 지정 가능 |
+| query | `?aiTag=0` | `#ai` 자동 태그 끔 (`ai_tag` 도 허용) |
+| query | `?mutate=1` | mutation 도구 노출 |
+| query | `?dryRun=1` | 모든 쓰기 no-op (`dry_run` 도 허용) |
+
+> **토큰은 query 에 넣지 마세요.** URL 은 액세스 로그·브라우저 히스토리·Referer 헤더에 그대로 남습니다. 토큰은 반드시 `Authorization: Bearer ...` 헤더(Claude.ai 커넥터의 표준 토큰 슬롯)로 전달하세요.
+
+Claude.ai 에 등록할 URL 예시 — 그래프마다 별도 커넥터로 등록:
+
+```
+https://roam-mcp.{your-account}.workers.dev/g/personal/mcp
+https://roam-mcp.{your-account}.workers.dev/g/work/mcp?mutate=1
+https://roam-mcp.{your-account}.workers.dev/g/sandbox/mcp?mutate=1&dryRun=1
+```
+
+각 커넥터의 인증 토큰 칸에는 해당 그래프의 `roam-graph-token-...` 을 넣으면 됩니다.
+
 ## MCP 클라이언트 연결
 
 ### Claude.ai (모바일 포함)
@@ -148,6 +174,12 @@ curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
 1. [claude.ai](https://claude.ai) → **Settings** → **Integrations**
 2. **Add Integration** 클릭
 3. URL 입력: `https://roam-mcp.{your-account}.workers.dev/mcp`
+   - 환경변수에 박힌 기본 그래프를 사용. 토큰 슬롯에 `roam-graph-token-...` 입력.
+4. (선택) **여러 그래프**를 한 Worker 에서 다루려면 그래프마다 커넥터를 따로 등록:
+   - `https://roam-mcp.../g/personal/mcp` (토큰: 해당 그래프 토큰)
+   - `https://roam-mcp.../g/work/mcp?mutate=1` (mutation 도구 노출)
+   - `https://roam-mcp.../g/sandbox/mcp?mutate=1&dryRun=1` (전부 no-op)
+   - 자세한 옵션은 위의 [요청별 설정](#요청별-설정-per-request-override) 참조.
 
 ### Claude Desktop
 
