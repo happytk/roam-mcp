@@ -2,14 +2,21 @@ name = "roam-mcp"
 main = "src/index.ts"
 compatibility_date = "2024-11-05"
 
-# 그래프 이름과 토큰은 secret으로 주입하거나, 매 요청마다 헤더로 덮어쓸 수 있음.
-# (기본값으로 특정 그래프 이름을 박아두지 않는다 — 누락 시 호출이 에러로 거부됨.)
+# 그래프 이름과 토큰은 secret으로 주입하거나, 매 요청마다 헤더/path/query 로
+# 덮어쓸 수 있음. (기본값으로 특정 그래프 이름을 박아두지 않는다 — 누락 시
+# 호출이 에러로 거부됨.) 우선순위: header > query > path > env.
 #
 # secret으로 주입하려면:
 #   npx wrangler secret put ROAM_GRAPH_NAME
 #   npx wrangler secret put ROAM_API_TOKEN
 #
-# 헤더로 덮어쓰려면:
+# 헤더로 덮어쓰려면 (curl, CI 처럼 커스텀 헤더가 가능한 클라이언트):
 #   X-Roam-Graph:  <graph-name>
 #   X-Roam-Token:  <roam-graph-token-...>      (또는 Authorization: Bearer ...)
 #   X-Roam-Ai-Tag: false                        (생략 시 ON; 끄려면 false/0/off/no)
+#   X-Roam-Mutate: true                         (update/delete/move 노출)
+#   X-Roam-Dry-Run: true                        (모든 쓰기 no-op)
+#
+# Claude.ai 같이 헤더를 못 넣는 커넥터용으로는 path + query 로 같은 효과:
+#   https://<host>/g/<graph>/mcp?aiTag=0&mutate=1&dryRun=0
+#   토큰은 Authorization: Bearer 슬롯으로 (URL 노출 방지).

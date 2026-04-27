@@ -769,15 +769,41 @@ function parseBoolHeader(value: string | null, defaultVal: boolean): boolean {
   return defaultVal;
 }
 
-function resolveEnv(request: Request, env: Env): EffectiveEnv {
-  const graph = request.headers.get("X-Roam-Graph") ?? env.ROAM_GRAPH_NAME ?? "";
+// Extract `/g/<graph>` prefix from the URL. Returns the graph name (if any)
+// and the remaining sub-path so the rest of the router treats e.g.
+// "/g/personal/mcp" exactly like "/mcp".
+function parsePath(pathname: string): { graphFromPath: string | null; subPath: string } {
+  const match = pathname.match(/^\/g\/([^/]+)(?:\/(.*))?$/);
+  if (!match) return { graphFromPath: null, subPath: pathname };
+  return { graphFromPath: decodeURIComponent(match[1]), subPath: "/" + (match[2] ?? "") };
+}
+
+// Priority for each setting: header > query > path (graph only) > env.
+// Token is intentionally NOT read from query strings — query params end up in
+// access logs, browser history, and referrers.
+function resolveEnv(request: Request, env: Env, graphFromPath: string | null = null): EffectiveEnv {
+  const q = new URL(request.url).searchParams;
+  const graph = request.headers.get("X-Roam-Graph")
+    ?? q.get("graph")
+    ?? graphFromPath
+    ?? env.ROAM_GRAPH_NAME
+    ?? "";
   const token = request.headers.get("X-Roam-Token")
     ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "")
     ?? env.ROAM_API_TOKEN
     ?? "";
-  const aiTag = parseBoolHeader(request.headers.get("X-Roam-Ai-Tag"), true);
-  const dryRun = parseBoolHeader(request.headers.get("X-Roam-Dry-Run"), false);
-  const mutate = parseBoolHeader(request.headers.get("X-Roam-Mutate"), false);
+  const aiTag = parseBoolHeader(
+    request.headers.get("X-Roam-Ai-Tag") ?? q.get("aiTag") ?? q.get("ai_tag"),
+    true,
+  );
+  const dryRun = parseBoolHeader(
+    request.headers.get("X-Roam-Dry-Run") ?? q.get("dryRun") ?? q.get("dry_run"),
+    false,
+  );
+  const mutate = parseBoolHeader(
+    request.headers.get("X-Roam-Mutate") ?? q.get("mutate"),
+    false,
+  );
   return {
     ROAM_GRAPH_NAME: graph,
     ROAM_API_TOKEN: token,
@@ -787,12 +813,12 @@ function resolveEnv(request: Request, env: Env): EffectiveEnv {
   };
 }
 
-async function handleMCP(request: Request, env: Env): Promise<Response> {
+async function handleMCP(request: Request, env: Env, graphFromPath: string | null): Promise<Response> {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
 
-  const effectiveEnv = resolveEnv(request, env);
+  const effectiveEnv = resolveEnv(request, env, graphFromPath);
 
   let body: any;
   try {
@@ -884,6 +910,7 @@ function withCors(res: Response): Response {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const { graphFromPath, subPath } = parsePath(url.pathname);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
@@ -891,7 +918,7 @@ export default {
 
     if (request.method === "GET") {
       // Claude.ai may try GET /mcp for SSE — return 405 to signal stateless mode
-      if (url.pathname === "/mcp") {
+      if (subPath === "/mcp") {
         return withCors(new Response("SSE not supported; use POST for stateless mode", {
           status: 405,
           headers: { Allow: "POST" },
@@ -900,8 +927,8 @@ export default {
 
       // Setup diagnostics: GET /check actually hits the Roam API to verify
       // that the token + graph name are configured correctly.
-      if (url.pathname === "/check") {
-        const checkEnv = resolveEnv(request, env);
+      if (subPath === "/check") {
+        const checkEnv = resolveEnv(request, env, graphFromPath);
         const hasGraph = !!checkEnv.ROAM_GRAPH_NAME;
         const hasToken = !!checkEnv.ROAM_API_TOKEN;
         const tokenPrefix = checkEnv.ROAM_API_TOKEN?.slice(0, 17) ?? "";
@@ -953,22 +980,37 @@ export default {
         Response.json({
           status: "ok",
           server: "roam-research-mcp",
-          graph: env.ROAM_GRAPH_NAME ?? null,
+          graph: graphFromPath ?? env.ROAM_GRAPH_NAME ?? null,
           tokenConfigured: !!env.ROAM_API_TOKEN,
+          // Settings precedence per request: header > query > path > env.
+          // Use header form when the client supports custom headers (curl, CI).
+          // Use path/query form for Claude.ai-style connectors that only let
+          // you register a URL + Authorization Bearer token.
           headers: {
-            "X-Roam-Graph": "graph name (overrides ROAM_GRAPH_NAME)",
-            "X-Roam-Token": "API token (overrides ROAM_API_TOKEN; or use Authorization: Bearer ...)",
+            "X-Roam-Graph": "graph name (overrides path/env)",
+            "X-Roam-Token": "API token (or Authorization: Bearer ...; overrides env)",
             "X-Roam-Ai-Tag": "false to disable #ai auto-tag (default: on)",
             "X-Roam-Mutate": "true to expose update/delete/move tools (default: off)",
             "X-Roam-Dry-Run": "true to make every write a no-op (default: off)",
+          },
+          path: {
+            "/g/<graph>/mcp": "graph name in path; pass token via Authorization: Bearer ...",
+            "/g/<graph>/check": "diagnostics for a specific graph",
+          },
+          query: {
+            graph: "graph name (alternative to path)",
+            aiTag: "false to disable #ai auto-tag",
+            mutate: "true to expose update/delete/move tools",
+            dryRun: "true to make every write a no-op",
           },
         })
       );
     }
 
-    // Accept POST at both "/" and "/mcp" — Claude.ai posts to the registered URL directly
+    // Accept POST at "/", "/mcp", "/g/<graph>", and "/g/<graph>/mcp".
+    // Claude.ai posts to the registered URL directly.
     if (request.method === "POST") {
-      return withCors(await handleMCP(request, env));
+      return withCors(await handleMCP(request, env, graphFromPath));
     }
 
     return withCors(new Response("Not Found", { status: 404 }));
