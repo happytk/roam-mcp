@@ -39,7 +39,25 @@ npx wrangler login
 
 브라우저가 열리면 Cloudflare 계정으로 로그인합니다.
 
-### 3. 그래프 이름 설정
+### 3. KV namespace 생성 (OAuth 토큰 저장용, 필수)
+
+OAuth provider 가 grant/access token 을 저장할 KV namespace 를 1개 만듭니다:
+
+```bash
+npx wrangler kv namespace create OAUTH_KV
+```
+
+출력에 찍히는 `id = "..."` 값을 복사해서 `wrangler.toml` 의 placeholder 자리에 붙여넣습니다:
+
+```toml
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "여기에-출력된-ID-붙여넣기"
+```
+
+> KV namespace ID 는 secret 이 아닙니다 — 외부에서 직접 접근할 수 없는 계정 내부 식별자라 평문 커밋해도 안전합니다. 비용은 무료 티어 안에서 충분 (100k reads/day, 1k writes/day).
+
+### 4. 그래프 이름 설정 (선택 — env 폴백 / `/check` 용)
 
 그래프 이름은 secret으로 등록합니다. (5단계의 토큰과 같은 방식)
 
@@ -49,9 +67,9 @@ npx wrangler secret put ROAM_GRAPH_NAME
 
 > 그래프 이름은 Roam URL `roamresearch.com/#/app/<graph-name>` 의 `<graph-name>` 과 정확히 일치해야 합니다. 대소문자와 하이픈까지 동일해야 합니다.
 
-이 값은 폴백입니다. 요청 시 `X-Roam-Graph` 헤더를 보내면 헤더 값이 우선 적용되므로, 한 Worker로 여러 그래프를 다룰 수도 있습니다. 헤더도 secret도 없으면 호출이 에러로 거부됩니다 (예전처럼 `happytk` 같은 하드코딩 기본값은 사용하지 않습니다).
+이 값은 OAuth 흐름과 무관한 폴백입니다 — `/check` 엔드포인트와 환경변수 기반 호출(curl/CI)에서 사용. **Claude.ai 처럼 OAuth 로 연결되는 클라이언트는 이 값을 무시하고 사용자가 `/authorize` 에서 직접 입력한 graph + token 을 grant 단위로 사용합니다.** 한 Worker 에 그래프 N 개를 붙이려면 OAuth 흐름이 정도이고, 이 secret 은 단일 그래프 환경에 편의용입니다.
 
-### 4. 최초 배포 (Worker 생성)
+### 5. 최초 배포 (Worker 생성)
 
 ```bash
 npx wrangler deploy
@@ -63,7 +81,7 @@ npx wrangler deploy
 https://roam-mcp.{your-account}.workers.dev
 ```
 
-### 5. API 토큰을 Secret으로 등록
+### 6. API 토큰을 Secret으로 등록 (선택 — env 폴백 / `/check` 용)
 
 ```bash
 npx wrangler secret put ROAM_API_TOKEN
@@ -81,7 +99,7 @@ npx wrangler secret list
 
 Secret은 즉시 반영되므로 재배포가 필요하지 않습니다.
 
-### 6. 토큰 검증 (중요)
+### 7. 토큰 검증 (선택)
 
 셋업이 올바른지 한 번에 확인할 수 있는 진단 엔드포인트입니다:
 
@@ -104,25 +122,37 @@ curl https://roam-mcp.{your-account}.workers.dev/check
 
 | `stage` | 원인 | 해결 |
 |---|---|---|
-| `token` + "not set" | Secret이 미등록 | 5단계 재실행 |
+| `token` + "not set" | Secret이 미등록 | 6단계 재실행 |
 | `token` + "does not start with" | 토큰 접두사 오류 | `roam-graph-token-`으로 시작하는 토큰으로 재등록 |
 | `roam-api` + "Token cannot be verified" | 토큰이 해당 그래프 소유가 아님 | 그래프 이름/토큰 매칭 재확인 |
 | `roam-api` + "404" | 그래프 이름 오타 | `wrangler.toml` 수정 후 `npx wrangler deploy` |
 
-### 7. MCP 엔드포인트 동작 확인
+### 8. MCP 엔드포인트 동작 확인
 
 ```bash
 curl https://roam-mcp.{your-account}.workers.dev/
-# {"status":"ok","server":"roam-research-mcp","graph":"your-graph-name","tokenConfigured":true}
+# {"status":"ok","server":"roam-research-mcp","graph":"your-graph-name","tokenConfigured":true,"oauth":{...}}
 
+# OAuth metadata (Claude.ai 가 자동으로 fetch)
+curl https://roam-mcp.{your-account}.workers.dev/.well-known/oauth-authorization-server
+
+# curl/CI: env 폴백 토큰 또는 직접 Bearer 토큰으로 호출 (resolveExternalToken 경로)
 curl -X POST https://roam-mcp.{your-account}.workers.dev/mcp \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer roam-graph-token-..." \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
+## 인증 모델
+
+서버는 두 가지 인증 경로를 지원합니다 (한 Worker 가 둘 다 동시에 처리):
+
+1. **OAuth 2.1 (Claude.ai 등 원격 MCP 커넥터용)** — Claude.ai 가 `/.well-known/oauth-authorization-server` 로 메타데이터 발견 → DCR 로 클라이언트 등록 → 사용자가 `/authorize` 페이지에서 graph + roam-graph-token 입력 → 서버가 토큰을 Roam API 에 검증한 뒤 grant 발급. 이후 모든 요청은 OAuth access token (Bearer) 으로 인증되고, grant 에 묶인 graph + token 이 `ctx.props` 로 핸들러에 주입됨. **그래프 N 개 = grant N 개 = 별도 OAuth 토큰 N 개.**
+2. **External token passthrough (curl/CI 호환)** — `Authorization: Bearer roam-graph-token-...` 처럼 토큰 자체가 `roam-graph-token-` 으로 시작하면 OAuth 조회를 건너뛰고 그대로 사용. graph 는 path/header/query/env 중에서 결정. 환경변수만 세팅된 단일 그래프 셋업이나 스크립트 호출에 편리.
+
 ## 요청별 설정 (per-request override)
 
-매 요청마다 그래프/토큰/옵션을 **헤더, path, query** 셋 중 어느 것으로든 전달할 수 있습니다. 우선순위는 **header > query > path > env** 입니다.
+매 요청마다 그래프/토큰/옵션을 OAuth grant, 헤더, path, query 중 어느 것으로든 전달할 수 있습니다. 우선순위: **OAuth props > header > query > path > env**. OAuth grant 가 있으면 이를 신뢰하고 외부 헤더/query 로 graph·token 을 덮어쓸 수 없습니다 (스푸핑 방어). 플래그(`aiTag`/`mutate`/`dryRun`)는 grant 와 무관하게 매 요청마다 토글 가능.
 
 ### 1) 헤더 — curl, CI, Claude Desktop 등 커스텀 헤더가 가능한 클라이언트
 
@@ -169,17 +199,22 @@ https://roam-mcp.{your-account}.workers.dev/g/sandbox/mcp?mutate=1&dryRun=1
 
 ## MCP 클라이언트 연결
 
-### Claude.ai (모바일 포함)
+### Claude.ai (모바일 포함) — OAuth 흐름
 
 1. [claude.ai](https://claude.ai) → **Settings** → **Integrations**
 2. **Add Integration** 클릭
-3. URL 입력: `https://roam-mcp.{your-account}.workers.dev/mcp`
-   - 환경변수에 박힌 기본 그래프를 사용. 토큰 슬롯에 `roam-graph-token-...` 입력.
-4. (선택) **여러 그래프**를 한 Worker 에서 다루려면 그래프마다 커넥터를 따로 등록:
-   - `https://roam-mcp.../g/personal/mcp` (토큰: 해당 그래프 토큰)
-   - `https://roam-mcp.../g/work/mcp?mutate=1` (mutation 도구 노출)
-   - `https://roam-mcp.../g/sandbox/mcp?mutate=1&dryRun=1` (전부 no-op)
-   - 자세한 옵션은 위의 [요청별 설정](#요청별-설정-per-request-override) 참조.
+3. URL 입력 (그래프별 1 개씩 등록):
+   - `https://roam-mcp.{your-account}.workers.dev/g/personal/mcp`
+   - `https://roam-mcp.{your-account}.workers.dev/g/work/mcp?mutate=1`
+   - `https://roam-mcp.{your-account}.workers.dev/g/sandbox/mcp?mutate=1&dryRun=1`
+4. Claude.ai 가 자동으로 OAuth metadata 를 발견하고 인증 페이지로 이동시킵니다.
+5. 우리 `/authorize` 페이지가 뜨면:
+   - **Graph name**: URL path 에서 자동으로 채워집니다 (`/g/personal/...` → `personal`). 비어 있으면 직접 입력.
+   - **Roam API token**: 해당 그래프의 `roam-graph-token-...` 붙여넣기.
+   - **Authorize** 클릭 → 서버가 Roam API 로 토큰 검증 → Claude.ai 로 자동 redirect.
+6. 인증 완료. 이후 Claude.ai 가 보내는 모든 요청은 OAuth access token 으로 인증되고, 입력하신 graph + token 이 grant 에 묶여 사용됩니다.
+
+> 토큰을 갱신하거나 권한을 회수하려면 Claude.ai 에서 해당 connector 를 disconnect → 다시 등록하면 됩니다 (새 OAuth grant 발급). 서버 KV 의 grant 는 access/refresh token TTL 에 따라 만료됩니다.
 
 ### Claude Desktop
 
@@ -240,8 +275,10 @@ curl http://localhost:8787/check
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare Dashboard → My Profile → API Tokens → Create Token → "Edit Cloudflare Workers" 템플릿 |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard 우측 사이드바의 Account ID |
-| `ROAM_API_TOKEN` | Roam API 토큰 (`roam-graph-token-...`). 배포 시마다 Worker secret으로 자동 동기화됨 |
-| `ROAM_GRAPH_NAME` | 그래프 이름. 배포 시마다 Worker secret으로 자동 동기화됨 |
+| `ROAM_API_TOKEN` | (선택) `/check` 스모크 테스트용 폴백 토큰 |
+| `ROAM_GRAPH_NAME` | (선택) `/check` 스모크 테스트용 폴백 그래프 이름 |
+
+> OAuth 흐름은 KV 에 저장된 grant 만 쓰므로 `ROAM_API_TOKEN`/`ROAM_GRAPH_NAME` 은 더 이상 운영에 필수가 아닙니다. CI 의 `/check` 스모크 테스트가 빨리 끝나도록 둘 다 등록해두는 것을 권장합니다. **`OAUTH_KV` namespace ID 는 secret 이 아니므로 `wrangler.toml` 에 직접 박아두세요.**
 
 ### 필요한 GitHub Variables (선택)
 
