@@ -2,6 +2,14 @@ name = "roam-mcp"
 main = "src/index.ts"
 compatibility_date = "2024-11-05"
 
+# OAuth provider needs a KV namespace named OAUTH_KV.
+# One-time setup before deploy:
+#   npx wrangler kv namespace create OAUTH_KV
+# Paste the printed `id` into the placeholder below, commit, deploy.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
 # 그래프 이름과 토큰은 secret으로 주입하거나, 매 요청마다 헤더/path/query 로
 # 덮어쓸 수 있음. (기본값으로 특정 그래프 이름을 박아두지 않는다 — 누락 시
 # 호출이 에러로 거부됨.) 우선순위: header > query > path > env.
@@ -17,6 +25,13 @@ compatibility_date = "2024-11-05"
 #   X-Roam-Mutate: true                         (update/delete/move 노출)
 #   X-Roam-Dry-Run: true                        (모든 쓰기 no-op)
 #
-# Claude.ai 같이 헤더를 못 넣는 커넥터용으로는 path + query 로 같은 효과:
+# Claude.ai 같이 커스텀 헤더를 못 넣는 커넥터에서는 OAuth 흐름을 사용:
+#   - URL 만 등록 (예: https://<host>/g/<graph>/mcp). 그래프는 path 로 힌트.
+#   - 첫 접속 시 /authorize 페이지에서 graph + roam-graph-token-... 을 입력.
+#   - 서버가 토큰을 검증한 뒤 OAuth grant 로 KV(OAUTH_KV) 에 저장하고,
+#     이후 요청은 OAuth access token (Bearer) 으로만 인증.
+#   - 그래프별 커넥터 = 그래프별 OAuth grant (각자 별도 토큰 보관).
+#
+# 또는 path + query 만으로도 (legacy/curl 호환):
 #   https://<host>/g/<graph>/mcp?aiTag=0&mutate=1&dryRun=0
-#   토큰은 Authorization: Bearer 슬롯으로 (URL 노출 방지).
+#   토큰은 Authorization: Bearer roam-graph-token-... (resolveExternalToken 이 처리).

@@ -1,6 +1,10 @@
+import OAuthProvider, { type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+
 interface Env {
   ROAM_API_TOKEN?: string;
   ROAM_GRAPH_NAME?: string;
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
 }
 
 interface EffectiveEnv {
@@ -9,6 +13,14 @@ interface EffectiveEnv {
   aiTag: boolean;
   dryRun: boolean;
   mutate: boolean;
+}
+
+// Props persisted in each OAuth grant. The OAuthProvider injects these into
+// `ctx.props` on every authenticated /mcp request so the API handler can act
+// on the user's specific graph + token without re-prompting.
+interface RoamProps {
+  graph: string;
+  token: string;
 }
 
 const ROAM_API_BASE = "https://api.roamresearch.com/api/graph";
@@ -778,17 +790,26 @@ function parsePath(pathname: string): { graphFromPath: string | null; subPath: s
   return { graphFromPath: decodeURIComponent(match[1]), subPath: "/" + (match[2] ?? "") };
 }
 
-// Priority for each setting: header > query > path (graph only) > env.
+// Priority for each setting: OAuth props > header > query > path (graph only) > env.
 // Token is intentionally NOT read from query strings — query params end up in
-// access logs, browser history, and referrers.
-function resolveEnv(request: Request, env: Env, graphFromPath: string | null = null): EffectiveEnv {
+// access logs, browser history, and referrers. When an OAuth grant is in play
+// (`props` set), it wins over every other source so a stolen header can't
+// override the user's authorized graph/token.
+function resolveEnv(
+  request: Request,
+  env: Env,
+  graphFromPath: string | null = null,
+  props: RoamProps | null = null,
+): EffectiveEnv {
   const q = new URL(request.url).searchParams;
-  const graph = request.headers.get("X-Roam-Graph")
+  const graph = props?.graph
+    ?? request.headers.get("X-Roam-Graph")
     ?? q.get("graph")
     ?? graphFromPath
     ?? env.ROAM_GRAPH_NAME
     ?? "";
-  const token = request.headers.get("X-Roam-Token")
+  const token = props?.token
+    ?? request.headers.get("X-Roam-Token")
     ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "")
     ?? env.ROAM_API_TOKEN
     ?? "";
@@ -813,12 +834,17 @@ function resolveEnv(request: Request, env: Env, graphFromPath: string | null = n
   };
 }
 
-async function handleMCP(request: Request, env: Env, graphFromPath: string | null): Promise<Response> {
+async function handleMCP(
+  request: Request,
+  env: Env,
+  graphFromPath: string | null,
+  props: RoamProps | null = null,
+): Promise<Response> {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
 
-  const effectiveEnv = resolveEnv(request, env, graphFromPath);
+  const effectiveEnv = resolveEnv(request, env, graphFromPath, props);
 
   let body: any;
   try {
@@ -905,100 +931,90 @@ function withCors(res: Response): Response {
   return new Response(res.body, { status: res.status, headers });
 }
 
-// --- Worker entry point ---
+// --- API handler (OAuth-protected: /mcp, /g/<graph>/mcp, /g/<graph>/check) ---
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+const apiHandler = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const { graphFromPath, subPath } = parsePath(url.pathname);
+    const props = ((ctx as unknown) as { props?: RoamProps }).props ?? null;
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
+    if (request.method === "GET" && subPath === "/mcp") {
+      return withCors(new Response("SSE not supported; use POST for stateless mode", {
+        status: 405,
+        headers: { Allow: "POST" },
+      }));
+    }
+
+    // OAuth-bound /check verifies the token actually granted to this caller.
+    // Useful for "did my Claude.ai connector authorize correctly?" debugging.
+    if (request.method === "GET" && subPath === "/check") {
+      return runCheck(request, env, graphFromPath, props);
+    }
+
+    if (request.method === "POST" && (subPath === "/mcp" || subPath === "/")) {
+      return withCors(await handleMCP(request, env, graphFromPath, props));
+    }
+
+    return withCors(new Response("Not Found", { status: 404 }));
+  },
+};
+
+// --- Default handler (unprotected: /, /check, /authorize, OAuth pages) ---
+
+const defaultHandler = {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
+    if (url.pathname === "/authorize") {
+      return handleAuthorize(request, env);
+    }
+
     if (request.method === "GET") {
-      // Claude.ai may try GET /mcp for SSE — return 405 to signal stateless mode
-      if (subPath === "/mcp") {
-        return withCors(new Response("SSE not supported; use POST for stateless mode", {
-          status: 405,
-          headers: { Allow: "POST" },
-        }));
-      }
-
       // Setup diagnostics: GET /check actually hits the Roam API to verify
-      // that the token + graph name are configured correctly.
-      if (subPath === "/check") {
-        const checkEnv = resolveEnv(request, env, graphFromPath);
-        const hasGraph = !!checkEnv.ROAM_GRAPH_NAME;
-        const hasToken = !!checkEnv.ROAM_API_TOKEN;
-        const tokenPrefix = checkEnv.ROAM_API_TOKEN?.slice(0, 17) ?? "";
-        const tokenLooksValid = tokenPrefix.startsWith("roam-graph-token-");
-        if (!hasGraph) {
-          return withCors(Response.json({
-            ok: false,
-            stage: "graph",
-            error: "ROAM_GRAPH_NAME is not set. Pass X-Roam-Graph header.",
-          }, { status: 500 }));
-        }
-        if (!hasToken) {
-          return withCors(Response.json({
-            ok: false,
-            stage: "token",
-            error: "ROAM_API_TOKEN is not set. Pass X-Roam-Token header or set the secret.",
-          }, { status: 500 }));
-        }
-        if (!tokenLooksValid) {
-          return withCors(Response.json({
-            ok: false,
-            stage: "token",
-            error: `Token does not start with "roam-graph-token-" (got prefix: "${tokenPrefix}"). Local tokens ("roam-graph-local-token-") cannot be used with the API.`,
-          }, { status: 500 }));
-        }
-        try {
-          const result = await roamQuery(
-            checkEnv,
-            "[:find ?title :where [?p :node/title ?title] :limit 1]"
-          );
-          return withCors(Response.json({
-            ok: true,
-            graph: checkEnv.ROAM_GRAPH_NAME,
-            message: "Token and graph name are valid. Roam API responded successfully.",
-            sampleCount: result.result?.length ?? 0,
-          }));
-        } catch (err) {
-          return withCors(Response.json({
-            ok: false,
-            stage: "roam-api",
-            graph: checkEnv.ROAM_GRAPH_NAME,
-            error: String(err),
-            hint: "Check that the graph name matches your token.",
-          }, { status: 500 }));
-        }
+      // that the token + graph name are configured correctly. This variant
+      // uses env-based token (CI smoke test path).
+      if (url.pathname === "/check") {
+        return runCheck(request, env, null, null);
       }
 
+      // Root: status + integration hints. The "graph" field reflects the
+      // env-bound default graph (used by /check and curl-style fallback);
+      // OAuth-mediated requests carry their own graph in the grant.
       return withCors(
         Response.json({
           status: "ok",
           server: "roam-research-mcp",
-          graph: graphFromPath ?? env.ROAM_GRAPH_NAME ?? null,
+          graph: env.ROAM_GRAPH_NAME ?? null,
           tokenConfigured: !!env.ROAM_API_TOKEN,
-          // Settings precedence per request: header > query > path > env.
-          // Use header form when the client supports custom headers (curl, CI).
-          // Use path/query form for Claude.ai-style connectors that only let
-          // you register a URL + Authorization Bearer token.
+          oauth: {
+            authorize: "/authorize",
+            token: "/token",
+            register: "/register",
+            metadata: "/.well-known/oauth-authorization-server",
+            note: "Claude.ai uses dynamic client registration — paste the connector URL and follow the OAuth consent prompt.",
+          },
+          path: {
+            "/g/<graph>/mcp": "Per-graph MCP endpoint. Each graph gets its own OAuth grant.",
+            "/g/<graph>/check": "OAuth-bound diagnostic for the granted token.",
+          },
           headers: {
-            "X-Roam-Graph": "graph name (overrides path/env)",
-            "X-Roam-Token": "API token (or Authorization: Bearer ...; overrides env)",
+            "X-Roam-Graph": "graph override (curl/CI only — ignored when an OAuth grant is present)",
+            "X-Roam-Token": "token override (curl/CI only)",
             "X-Roam-Ai-Tag": "false to disable #ai auto-tag (default: on)",
             "X-Roam-Mutate": "true to expose update/delete/move tools (default: off)",
             "X-Roam-Dry-Run": "true to make every write a no-op (default: off)",
           },
-          path: {
-            "/g/<graph>/mcp": "graph name in path; pass token via Authorization: Bearer ...",
-            "/g/<graph>/check": "diagnostics for a specific graph",
-          },
           query: {
-            graph: "graph name (alternative to path)",
+            graph: "graph name (alternative to path; curl/CI only)",
             aiTag: "false to disable #ai auto-tag",
             mutate: "true to expose update/delete/move tools",
             dryRun: "true to make every write a no-op",
@@ -1007,12 +1023,240 @@ export default {
       );
     }
 
-    // Accept POST at "/", "/mcp", "/g/<graph>", and "/g/<graph>/mcp".
-    // Claude.ai posts to the registered URL directly.
-    if (request.method === "POST") {
-      return withCors(await handleMCP(request, env, graphFromPath));
-    }
-
     return withCors(new Response("Not Found", { status: 404 }));
   },
 };
+
+// --- Shared diagnostic ---
+
+async function runCheck(
+  request: Request,
+  env: Env,
+  graphFromPath: string | null,
+  props: RoamProps | null,
+): Promise<Response> {
+  const checkEnv = resolveEnv(request, env, graphFromPath, props);
+  const hasGraph = !!checkEnv.ROAM_GRAPH_NAME;
+  const hasToken = !!checkEnv.ROAM_API_TOKEN;
+  const tokenPrefix = checkEnv.ROAM_API_TOKEN?.slice(0, 17) ?? "";
+  const tokenLooksValid = tokenPrefix.startsWith("roam-graph-token-");
+  if (!hasGraph) {
+    return withCors(Response.json({
+      ok: false,
+      stage: "graph",
+      error: "ROAM_GRAPH_NAME is not set. Authorize via /authorize, set the env secret, or pass X-Roam-Graph.",
+    }, { status: 500 }));
+  }
+  if (!hasToken) {
+    return withCors(Response.json({
+      ok: false,
+      stage: "token",
+      error: "ROAM_API_TOKEN is not set. Authorize via /authorize, set the env secret, or pass X-Roam-Token.",
+    }, { status: 500 }));
+  }
+  if (!tokenLooksValid) {
+    return withCors(Response.json({
+      ok: false,
+      stage: "token",
+      error: `Token does not start with "roam-graph-token-" (got prefix: "${tokenPrefix}"). Local tokens ("roam-graph-local-token-") cannot be used with the API.`,
+    }, { status: 500 }));
+  }
+  try {
+    const result = await roamQuery(
+      checkEnv,
+      "[:find ?title :where [?p :node/title ?title] :limit 1]"
+    );
+    return withCors(Response.json({
+      ok: true,
+      graph: checkEnv.ROAM_GRAPH_NAME,
+      source: props ? "oauth-grant" : "env",
+      message: "Token and graph name are valid. Roam API responded successfully.",
+      sampleCount: result.result?.length ?? 0,
+    }));
+  } catch (err) {
+    return withCors(Response.json({
+      ok: false,
+      stage: "roam-api",
+      graph: checkEnv.ROAM_GRAPH_NAME,
+      error: String(err),
+      hint: "Check that the graph name matches your token.",
+    }, { status: 500 }));
+  }
+}
+
+// --- OAuth /authorize consent flow ---
+
+// GET shows a small HTML form prompting for the roam token (and graph if not
+// inferable from the connector URL). POST validates the token against the Roam
+// API, then asks the OAuthProvider to issue an authorization code bound to
+// `{graph, token}` props that the API handler will later read from ctx.props.
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const provider = env.OAUTH_PROVIDER;
+
+  if (request.method === "GET") {
+    let oauthReqInfo;
+    try {
+      oauthReqInfo = await provider.parseAuthRequest(request);
+    } catch (err) {
+      return new Response(`Invalid OAuth request: ${err}`, { status: 400 });
+    }
+    const clientInfo = await provider.lookupClient(oauthReqInfo.clientId);
+    const graphHint = inferGraphFromAuthRequest(request, oauthReqInfo);
+    return new Response(renderAuthorizePage({
+      oauthReqInfo,
+      clientName: clientInfo?.clientName ?? clientInfo?.clientUri ?? "an MCP client",
+      graphHint,
+      error: null,
+    }), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+
+  if (request.method === "POST") {
+    const form = await request.formData();
+    const graph = String(form.get("graph") ?? "").trim();
+    const token = String(form.get("token") ?? "").trim();
+    const oauthReqJson = String(form.get("oauthReqInfo") ?? "");
+    let oauthReqInfo: any;
+    try {
+      oauthReqInfo = JSON.parse(oauthReqJson);
+    } catch {
+      return new Response("Missing OAuth request context. Restart the authorization from your client.", { status: 400 });
+    }
+    const clientInfo = await provider.lookupClient(oauthReqInfo.clientId);
+    const renderError = (msg: string, status = 400) =>
+      new Response(renderAuthorizePage({
+        oauthReqInfo,
+        clientName: clientInfo?.clientName ?? clientInfo?.clientUri ?? "an MCP client",
+        graphHint: graph,
+        error: msg,
+      }), { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+
+    if (!graph) return renderError("Graph name is required.");
+    if (!token) return renderError("Roam API token is required.");
+    if (!token.startsWith("roam-graph-token-")) {
+      return renderError(`Token must start with "roam-graph-token-". Local tokens ("roam-graph-local-token-") cannot be used with the API.`);
+    }
+    try {
+      await roamQuery(
+        { ROAM_GRAPH_NAME: graph, ROAM_API_TOKEN: token, aiTag: false, dryRun: false, mutate: false },
+        "[:find ?title :where [?p :node/title ?title] :limit 1]",
+      );
+    } catch (err) {
+      return renderError(`Roam API rejected the token for graph "${graph}": ${err}`);
+    }
+    const { redirectTo } = await provider.completeAuthorization({
+      request: oauthReqInfo,
+      userId: graph,
+      metadata: { graph },
+      scope: oauthReqInfo.scope ?? [],
+      props: { graph, token } satisfies RoamProps,
+    });
+    return Response.redirect(redirectTo, 302);
+  }
+
+  return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, POST" } });
+}
+
+// Pull a graph hint from the OAuth `resource` parameter (RFC 8707) — Claude
+// passes the connector URL there, so /g/<graph>/mcp lets us pre-fill the form.
+// Falls back to the request's own URL path or query.
+function inferGraphFromAuthRequest(request: Request, oauthReqInfo: { resource?: string | string[] }): string {
+  const resources = Array.isArray(oauthReqInfo.resource)
+    ? oauthReqInfo.resource
+    : oauthReqInfo.resource ? [oauthReqInfo.resource] : [];
+  for (const r of resources) {
+    try {
+      const { graphFromPath } = parsePath(new URL(r).pathname);
+      if (graphFromPath) return graphFromPath;
+    } catch {
+      // not a valid URL — ignore
+    }
+  }
+  const url = new URL(request.url);
+  const { graphFromPath } = parsePath(url.pathname);
+  return graphFromPath ?? url.searchParams.get("graph") ?? "";
+}
+
+function htmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    c === "&" ? "&amp;" :
+    c === "<" ? "&lt;" :
+    c === ">" ? "&gt;" :
+    c === '"' ? "&quot;" :
+    "&#39;");
+}
+
+function renderAuthorizePage(opts: {
+  oauthReqInfo: unknown;
+  clientName: string;
+  graphHint: string;
+  error: string | null;
+}): string {
+  const { oauthReqInfo, clientName, graphHint, error } = opts;
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize Roam access</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 2em auto; padding: 0 1em; line-height: 1.5; color: #1f2328; }
+  h1 { font-size: 1.4em; }
+  .client { background: #f6f8fa; border: 1px solid #d0d7de; padding: .75em 1em; border-radius: 6px; margin-bottom: 1em; }
+  .error { background: #ffebe9; border: 1px solid #ff8182; color: #82071e; padding: .5em .75em; border-radius: 6px; margin-bottom: 1em; }
+  label { display: block; margin-top: 1em; font-weight: 600; }
+  input[type=text], input[type=password] { width: 100%; padding: .5em; margin-top: .25em; box-sizing: border-box; font-size: 1em; border: 1px solid #d0d7de; border-radius: 6px; }
+  small { color: #57606a; display: block; margin-top: .25em; }
+  button { margin-top: 1.5em; padding: .65em 1.25em; font-size: 1em; background: #1f883d; color: white; border: 0; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #1a7f37; }
+  code { background: #eaeef2; padding: 0 .25em; border-radius: 3px; }
+</style>
+</head><body>
+<h1>Authorize Roam graph access</h1>
+<div class="client"><b>${htmlEscape(clientName)}</b> is requesting access to a Roam graph through your roam-mcp Worker.</div>
+${error ? `<div class="error">${htmlEscape(error)}</div>` : ""}
+<form method="POST">
+  <input type="hidden" name="oauthReqInfo" value="${htmlEscape(JSON.stringify(oauthReqInfo))}">
+  <label>Graph name
+    <input type="text" name="graph" value="${htmlEscape(graphHint)}" required autocomplete="off" spellcheck="false">
+  </label>
+  <small>The name in your Roam URL: <code>roamresearch.com/#/app/<b>graph-name</b></code>.</small>
+  <label>Roam API token
+    <input type="password" name="token" placeholder="roam-graph-token-..." required autocomplete="off" spellcheck="false">
+  </label>
+  <small>Generate one in Roam → Settings → API tokens. Must start with <code>roam-graph-token-</code> (local tokens won't work).</small>
+  <button type="submit">Authorize</button>
+</form>
+</body></html>`;
+}
+
+// --- Worker entry point ---
+//
+// `OAuthProvider` intercepts /.well-known/oauth-authorization-server, /token,
+// and /register; routes /authorize and other paths to `defaultHandler`; and
+// only forwards requests under `apiRoute` to `apiHandler` once the bearer
+// token validates (either OAuth-issued or, via `resolveExternalToken` below,
+// a raw `roam-graph-token-...` for curl/CI compatibility).
+export default new OAuthProvider({
+  apiRoute: ["/mcp", "/g/"],
+  apiHandler,
+  defaultHandler,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+  // Treat a bearer token shaped like `roam-graph-token-...` as a self-bearing
+  // credential — bypass OAuth lookup and synthesize props from the request's
+  // graph hint (path/header/env). Lets `curl /mcp -H 'Authorization: Bearer
+  // roam-graph-token-...'` keep working alongside Claude.ai's OAuth flow.
+  resolveExternalToken: async ({ token, request, env }) => {
+    if (!token.startsWith("roam-graph-token-")) return null;
+    const e = env as Env;
+    const url = new URL(request.url);
+    const { graphFromPath } = parsePath(url.pathname);
+    const graph = request.headers.get("X-Roam-Graph")
+      ?? url.searchParams.get("graph")
+      ?? graphFromPath
+      ?? e.ROAM_GRAPH_NAME
+      ?? null;
+    if (!graph) return null;
+    return { props: { graph, token } satisfies RoamProps };
+  },
+});
