@@ -57,6 +57,30 @@ id = "여기에-출력된-ID-붙여넣기"
 
 > KV namespace ID 는 secret 이 아닙니다 — 외부에서 직접 접근할 수 없는 계정 내부 식별자라 평문 커밋해도 안전합니다. 비용은 무료 티어 안에서 충분 (100k reads/day, 1k writes/day).
 
+### 3-b. R2 버킷 생성 (이미지 업로드 도구용, 선택)
+
+`roam_upload_image` 를 사용하려면 R2 버킷이 필요합니다. 사용 안 할 거면 이 단계 건너뛰어도 다른 도구는 정상 동작합니다.
+
+```bash
+npx wrangler r2 bucket create roam-images
+```
+
+생성한 뒤 Cloudflare Dashboard → R2 → `roam-images` → **Settings** 에서 다음 중 하나를 선택:
+
+- **r2.dev 공개 접근 활성화** (빠른 시작): `Public access` → `Allow Access` → `pub-<hash>.r2.dev` URL 발급
+- **커스텀 도메인 연결** (장기 운영용): `Custom Domains` → `Connect Domain` → 본인 도메인의 서브도메인 (예: `img.happytk.dev`) 입력
+
+발급된 base URL 을 `wrangler.toml` 의 `[vars] R2_PUBLIC_BASE_URL` 에 붙여넣고 재배포합니다:
+
+```toml
+[vars]
+R2_PUBLIC_BASE_URL = "https://pub-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.r2.dev"
+```
+
+> 이 버킷은 단일 버킷 + `<graph>/...` prefix 로 그래프별 격리. 즉 같은 객체 listing 권한도 한 곳만 관리하면 됩니다. r2.dev URL 은 그대로 두고 나중에 custom domain 으로 갈아끼우려면 `R2_PUBLIC_BASE_URL` 한 줄만 바꾸면 됨.
+
+> **저작권 / 사용 의도**: 이 버킷은 개인 학습·주석 용도이며 third-party 콘텐츠를 public 배포할 의도가 없습니다. 객체 키에 random suffix 8자 이상을 포함해 enumeration 을 어렵게 두지만, 공유가 곤란한 자료는 업로드하지 마세요.
+
 ### 4. 그래프 이름 설정 (선택 — env 폴백 / `/check` 용)
 
 그래프 이름은 secret으로 등록합니다. (5단계의 토큰과 같은 방식)
@@ -306,6 +330,7 @@ curl http://localhost:8787/check
 | `roam_rename_page` ⚑ | 페이지 제목 변경 |
 | `roam_delete_page` ⚑ | 페이지와 모든 블록을 영구 삭제 (블록 삭제보다 파급 큼) |
 | `roam_datomic_query` | 직접 Datalog 쿼리 실행 |
+| `roam_upload_image` | base64 이미지를 R2 에 업로드하고 Roam 블록에 붙여넣을 마크다운 스니펫과 public URL 반환 (책 그림 + 출처 메타데이터 보존용) |
 
 ⚑ 표시는 mutate 도구 — 기본 OFF. 요청에 `X-Roam-Mutate: true` 헤더를 보내야 노출되고 호출 가능. dry-run 시뮬레이션은 `X-Roam-Dry-Run: true` 헤더로.
 
