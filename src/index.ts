@@ -5,6 +5,8 @@ interface Env {
   ROAM_GRAPH_NAME?: string;
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
+  ROAM_IMAGES?: R2Bucket;
+  R2_PUBLIC_BASE_URL?: string;
 }
 
 interface EffectiveEnv {
@@ -13,6 +15,8 @@ interface EffectiveEnv {
   aiTag: boolean;
   dryRun: boolean;
   mutate: boolean;
+  ROAM_IMAGES?: R2Bucket;
+  R2_PUBLIC_BASE_URL?: string;
 }
 
 // Props persisted in each OAuth grant. The OAuthProvider injects these into
@@ -126,6 +130,119 @@ function normalizePageTitle(title: string): string {
   const day = parseInt(dayStr, 10);
   if (day < 1 || day > 31) return title;
   return `${month} ${day}${ordinalSuffix(day)}, ${year}`;
+}
+
+// --- R2 image upload helpers ---
+
+const ALLOWED_IMAGE_MIME = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/svg+xml",
+]);
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+};
+
+// 10MB upload ceiling. R2 itself accepts much larger objects, but MCP JSON-RPC
+// payloads are base64-inlined and large bodies blow up Worker memory + client
+// timeouts. EPUB figures and book scans comfortably fit below this.
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+function randomSuffix(): string {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  return Array.from({ length: 10 }, () =>
+    chars[Math.floor(Math.random() * chars.length)]
+  ).join("");
+}
+
+// Strip path traversal, slashes, and control chars from a single key segment.
+// Allows ascii alnum + dot/dash/underscore. Everything else becomes "-".
+function sanitizeSegment(s: string): string {
+  return s
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/^\.+/, "")
+    .replace(/\.+$/, "")
+    .slice(0, 80) || "x";
+}
+
+// Same as sanitizeSegment but preserves "/" so a customPath like
+// "books/foo/bar.jpg" stays multi-segment. Each segment is still scrubbed
+// individually to block traversal ("../") and absolute paths.
+function sanitizePath(s: string): string {
+  return s
+    .split("/")
+    .filter((seg) => seg.length > 0)
+    .map(sanitizeSegment)
+    .join("/");
+}
+
+function decodeBase64(b64: string): Uint8Array {
+  const cleaned = b64.replace(/^data:[^;]+;base64,/, "").replace(/\s+/g, "");
+  const bin = atob(cleaned);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function buildImageKey(args: {
+  graph: string;
+  bookId?: string;
+  chapter?: string;
+  figureId?: string;
+  customPath?: string;
+  ext: string;
+}): string {
+  const graphPrefix = sanitizeSegment(args.graph);
+  if (args.customPath) {
+    const cleaned = sanitizePath(args.customPath);
+    if (!cleaned) {
+      throw new Error("customPath is empty after sanitization.");
+    }
+    return `${graphPrefix}/${cleaned}`;
+  }
+  const suffix = randomSuffix();
+  if (args.bookId) {
+    const book = sanitizeSegment(args.bookId);
+    const chapter = args.chapter ? sanitizeSegment(args.chapter) : "misc";
+    const stem = args.figureId
+      ? `${sanitizeSegment(args.figureId)}-${suffix}`
+      : suffix;
+    return `${graphPrefix}/books/${book}/${chapter}/${stem}.${args.ext}`;
+  }
+  const now = new Date();
+  const yyyy = String(now.getUTCFullYear());
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  return `${graphPrefix}/misc/${yyyy}/${mm}/${suffix}.${args.ext}`;
+}
+
+function buildImageMarkdown(opts: {
+  url: string;
+  caption?: string;
+  bookTitle?: string;
+  chapter?: string;
+  figureId?: string;
+}): string {
+  const alt = opts.caption ?? opts.figureId ?? "";
+  const image = `![${alt}](${opts.url})`;
+  const sourceParts: string[] = [];
+  if (opts.bookTitle) sourceParts.push(`[[${opts.bookTitle}]]`);
+  if (opts.chapter) sourceParts.push(opts.chapter);
+  if (opts.figureId) sourceParts.push(opts.figureId);
+  if (opts.caption && !opts.bookTitle && !opts.chapter && !opts.figureId) {
+    // No book metadata at all — caption already lives in alt text, don't
+    // duplicate it on a second line.
+    return image;
+  }
+  if (sourceParts.length === 0) return image;
+  const captionTail = opts.caption ? ` "${opts.caption}"` : "";
+  return `${image}\n출처: ${sourceParts.join(" ")}${captionTail}`;
 }
 
 // Recursively create a subtree of blocks under a given parent uid. Each node
@@ -386,6 +503,57 @@ const TOOLS = [
         query: { type: "string", description: "Datalog query string" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "roam_upload_image",
+    description:
+      "Upload an image to R2 and get back a public URL plus a Roam-ready markdown snippet. Use this BEFORE roam_create_block when you want a figure in a block — pass the returned `markdownSnippet` as the block `content`. Primary use case: inserting EPUB/book figures into a study graph with source metadata (book title, chapter, figure id) preserved as R2 object metadata for later auditability.\n\nThe returned `markdownSnippet` already contains `![alt](url)` plus an 출처 line with [[book]] backlinks when book metadata is provided.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        imageData: {
+          type: "string",
+          description:
+            "Base64-encoded image bytes. Accepts a plain base64 string or a `data:image/...;base64,` data URL. Max 10MB decoded.",
+        },
+        mimeType: {
+          type: "string",
+          description:
+            "MIME type of the image. Allowed: image/jpeg, image/png, image/webp, image/gif, image/svg+xml.",
+        },
+        bookId: {
+          type: "string",
+          description:
+            "Book identifier (ISBN or user-defined slug). Used to group images under `<graph>/books/<bookId>/...`.",
+        },
+        bookTitle: {
+          type: "string",
+          description:
+            "Human-readable book title. Stored in R2 custom metadata and used as a [[book]] backlink in the returned markdown.",
+        },
+        chapter: {
+          type: "string",
+          description:
+            "Chapter number or title. Used as a sub-folder under `books/<bookId>/<chapter>/` and shown in the 출처 line.",
+        },
+        caption: {
+          type: "string",
+          description:
+            "Figure caption. Becomes the markdown alt text and is appended (quoted) to the 출처 line.",
+        },
+        figureId: {
+          type: "string",
+          description:
+            "Figure identifier within the book (e.g. 'fig-3-2'). Used as the file stem and shown in the 출처 line.",
+        },
+        customPath: {
+          type: "string",
+          description:
+            "Override the book/chapter/figureId path scheme with an explicit relative key (e.g. 'misc/photos/sunset.jpg'). Each segment is sanitized; absolute paths and '..' are rejected. The graph prefix is still prepended.",
+        },
+      },
+      required: ["imageData", "mimeType"],
     },
   },
 ];
@@ -766,6 +934,116 @@ async function callTool(
       return JSON.stringify(result.result, null, 2);
     }
 
+    case "roam_upload_image": {
+      const {
+        imageData,
+        mimeType,
+        bookId,
+        bookTitle,
+        chapter,
+        caption,
+        figureId,
+        customPath,
+      } = args;
+
+      if (!imageData || typeof imageData !== "string") {
+        throw new Error("imageData (base64 string) is required.");
+      }
+      if (!mimeType || !ALLOWED_IMAGE_MIME.has(mimeType)) {
+        throw new Error(
+          `mimeType must be one of: ${[...ALLOWED_IMAGE_MIME].join(", ")} (got ${mimeType ?? "missing"}).`
+        );
+      }
+      if (!env.ROAM_GRAPH_NAME) {
+        throw new Error("Graph context is required for image upload — authorize a graph or pass X-Roam-Graph.");
+      }
+      if (!env.R2_PUBLIC_BASE_URL) {
+        throw new Error(
+          "R2_PUBLIC_BASE_URL is not set. Configure it in wrangler.toml [vars] (e.g. the bucket's r2.dev URL or a custom domain) before uploading."
+        );
+      }
+      if (!env.ROAM_IMAGES) {
+        throw new Error(
+          "ROAM_IMAGES R2 binding is not configured. Add the [[r2_buckets]] entry to wrangler.toml and redeploy."
+        );
+      }
+
+      let bytes: Uint8Array;
+      try {
+        bytes = decodeBase64(imageData);
+      } catch (err) {
+        throw new Error(`imageData base64 decode failed: ${err}`);
+      }
+      if (bytes.length === 0) {
+        throw new Error("imageData decoded to 0 bytes.");
+      }
+      if (bytes.length > MAX_IMAGE_BYTES) {
+        throw new Error(
+          `Image exceeds ${MAX_IMAGE_BYTES} bytes (got ${bytes.length}). Resize/recompress before upload.`
+        );
+      }
+
+      const ext = MIME_TO_EXT[mimeType];
+      const key = buildImageKey({
+        graph: env.ROAM_GRAPH_NAME,
+        bookId,
+        chapter,
+        figureId,
+        customPath,
+        ext,
+      });
+
+      const uploadedAt = new Date().toISOString();
+      const customMetadata: Record<string, string> = {
+        sourceGraph: env.ROAM_GRAPH_NAME,
+        uploadedAt,
+      };
+      if (bookId) customMetadata.bookId = String(bookId);
+      if (bookTitle) customMetadata.bookTitle = String(bookTitle);
+      if (chapter) customMetadata.chapter = String(chapter);
+      if (caption) customMetadata.caption = String(caption);
+      if (figureId) customMetadata.figureId = String(figureId);
+
+      const url = `${env.R2_PUBLIC_BASE_URL.replace(/\/+$/, "")}/${key}`;
+      const markdownSnippet = buildImageMarkdown({
+        url,
+        caption,
+        bookTitle,
+        chapter,
+        figureId,
+      });
+
+      if (env.dryRun) {
+        return JSON.stringify({
+          dry_run: true,
+          url: `https://dry-run.example/${key}`,
+          key,
+          size: bytes.length,
+          markdownSnippet: buildImageMarkdown({
+            url: `https://dry-run.example/${key}`,
+            caption,
+            bookTitle,
+            chapter,
+            figureId,
+          }),
+          customMetadata,
+        }, null, 2);
+      }
+
+      await env.ROAM_IMAGES.put(key, bytes, {
+        httpMetadata: { contentType: mimeType },
+        customMetadata,
+      });
+
+      return JSON.stringify({
+        success: true,
+        url,
+        key,
+        size: bytes.length,
+        markdownSnippet,
+      }, null, 2);
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -831,6 +1109,8 @@ function resolveEnv(
     aiTag,
     dryRun,
     mutate,
+    ROAM_IMAGES: env.ROAM_IMAGES,
+    R2_PUBLIC_BASE_URL: env.R2_PUBLIC_BASE_URL,
   };
 }
 

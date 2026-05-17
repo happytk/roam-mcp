@@ -7,3 +7,10 @@
 
 ROAM_API_TOKEN=roam-graph-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ROAM_GRAPH_NAME=your-graph-name
+
+# Public base URL for the roam-images R2 bucket. Required for roam_upload_image.
+# After enabling r2.dev public access (or attaching a custom domain), paste the
+# base URL here so uploaded keys resolve to a real public URL.
+#   r2.dev:          https://pub-<hash>.r2.dev
+#   custom domain:   https://img.example.com
+R2_PUBLIC_BASE_URL=
