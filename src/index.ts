@@ -1196,11 +1196,66 @@ async function handleMCP(
   }
 }
 
+// --- R2 upload handler (PUT /upload/<key>, PUT /g/<graph>/upload/<key>) ---
+//
+// Auth is enforced upstream by OAuthProvider — reaching this handler at all
+// means the caller presented a valid OAuth bearer or a `roam-graph-token-...`
+// that resolveExternalToken accepted. We don't re-check the token here.
+//
+// Dedupe is by-key: if `ROAM_IMAGES.head(key)` finds an object we don't
+// re-upload (R2 PUT is overwrite-by-default; this saves the write and signals
+// to the caller that they can reuse the existing URL — e.g. for content-hashed
+// keys). The bucket binding is shared with the roam_upload_image MCP tool.
+async function handleUpload(
+  request: Request,
+  env: Env,
+  rawKey: string,
+): Promise<Response> {
+  if (request.method !== "PUT") {
+    return new Response("Method Not Allowed", {
+      status: 405,
+      headers: { Allow: "PUT" },
+    });
+  }
+  const key = decodeURIComponent(rawKey);
+  if (!key || key.startsWith("/") || key.includes("..") || key.includes("\0")) {
+    return Response.json({ error: "invalid key" }, { status: 400 });
+  }
+  const base = env.R2_PUBLIC_BASE_URL?.replace(/\/+$/, "");
+  if (!base) {
+    return Response.json(
+      { error: "R2_PUBLIC_BASE_URL is not configured on the worker" },
+      { status: 500 },
+    );
+  }
+  if (!env.ROAM_IMAGES) {
+    return Response.json(
+      { error: "ROAM_IMAGES R2 binding is not configured on the worker" },
+      { status: 500 },
+    );
+  }
+  const publicUrl = `${base}/${key.split("/").map(encodeURIComponent).join("/")}`;
+
+  const existing = await env.ROAM_IMAGES.head(key);
+  if (existing) {
+    return Response.json({ duplicate: true, url: publicUrl });
+  }
+  if (!request.body) {
+    return Response.json({ error: "missing request body" }, { status: 400 });
+  }
+  const contentType =
+    request.headers.get("Content-Type") ?? "application/octet-stream";
+  await env.ROAM_IMAGES.put(key, request.body, {
+    httpMetadata: { contentType },
+  });
+  return Response.json({ duplicate: false, url: publicUrl });
+}
+
 // --- CORS headers ---
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
   "Access-Control-Allow-Headers":
     "Content-Type, Authorization, X-Roam-Graph, X-Roam-Token, X-Roam-Ai-Tag, X-Roam-Mutate, X-Roam-Dry-Run",
 };
@@ -1234,6 +1289,11 @@ const apiHandler = {
     // Useful for "did my Claude.ai connector authorize correctly?" debugging.
     if (request.method === "GET" && subPath === "/check") {
       return runCheck(request, env, graphFromPath, props);
+    }
+
+    if (subPath.startsWith("/upload/")) {
+      const key = subPath.slice("/upload/".length);
+      return withCors(await handleUpload(request, env, key));
     }
 
     if (request.method === "POST" && (subPath === "/mcp" || subPath === "/")) {
@@ -1516,7 +1576,7 @@ ${error ? `<div class="error">${htmlEscape(error)}</div>` : ""}
 // token validates (either OAuth-issued or, via `resolveExternalToken` below,
 // a raw `roam-graph-token-...` for curl/CI compatibility).
 export default new OAuthProvider({
-  apiRoute: ["/mcp", "/g/"],
+  apiRoute: ["/mcp", "/g/", "/upload/"],
   apiHandler,
   defaultHandler,
   authorizeEndpoint: "/authorize",

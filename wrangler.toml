@@ -10,24 +10,25 @@ compatibility_date = "2024-11-05"
 binding = "OAUTH_KV"
 id = "fe7a1754a6e64e278090c19f7837ba01"
 
-# R2 bucket for image uploads (used by roam_upload_image).
+# R2 bucket for image uploads. Used by both the roam_upload_image MCP tool
+# (base64 in JSON-RPC, server-built keys under <graph>/books/...) and the
+# PUT /upload/<key> HTTP endpoint (raw binary, client-chosen keys).
 # One-time setup before deploy:
 #   npx wrangler r2 bucket create roam-images
-# Images are stored under "<graph>/..." prefixes so a single bucket
-# serves every Roam graph without cross-contamination.
+# Images are stored under "<graph>/..." prefixes for graph isolation.
 [[r2_buckets]]
 binding = "ROAM_IMAGES"
 bucket_name = "roam-images"
 
-# Public base URL for uploaded images. Set this once the bucket has
-# public read enabled (r2.dev) or a custom domain attached.
+# Public base URL for the ROAM_IMAGES bucket. NO trailing slash.
+# Set this once the bucket has public read enabled (r2.dev) or a custom
+# domain attached. Both upload paths refuse to run when unset so a
+# half-configured deploy can't return broken URLs.
 # Examples:
-#   "https://pub-<hash>.r2.dev"           # r2.dev public bucket (quick start)
-#   "https://img.happytk.dev"             # R2 custom domain (preferred long term)
-# When unset, roam_upload_image refuses to run so a half-configured
-# deploy can't return broken image URLs.
+#   "https://pub-<hash>.r2.dev"     # r2.dev public bucket (quick start)
+#   "https://img.happytk.dev"       # R2 custom domain (preferred long term)
 [vars]
-R2_PUBLIC_BASE_URL = ""
+R2_PUBLIC_BASE_URL = "https://pub-2bdbeeee0e40494fa017db7774cbbac2.r2.dev"
 
 # 그래프 이름과 토큰은 secret으로 주입하거나, 매 요청마다 헤더/path/query 로
 # 덮어쓸 수 있음. (기본값으로 특정 그래프 이름을 박아두지 않는다 — 누락 시
