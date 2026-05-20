@@ -694,8 +694,7 @@ async function callTool(
       const query =
         `[:find (pull ?p [:node/title :block/uid ` +
         `{:block/children [:block/string :block/uid :block/order ` +
-        `{:block/children [:block/string :block/uid :block/order ` +
-        `{:block/children [:block/string :block/uid :block/order]}]}]}]) ` +
+        `{:block/children ...}]}]) ` +
         `:where [?p :node/title "${esc(title)}"]]`;
       const result = await roamQuery(env, query);
       if (!result.result?.length) {
